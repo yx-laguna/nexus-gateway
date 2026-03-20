@@ -12,7 +12,12 @@
  */
 
 import "dotenv/config";
-import { createZGServingNetworkBroker } from "@0glabs/0g-serving-broker";
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+import ZGModule from "@0glabs/0g-serving-broker";
+// The package may export the factory as default or as a named member
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const createZGServingNetworkBroker: (signer: any) => Promise<any> =
+  (ZGModule as any).createZGServingNetworkBroker ?? ZGModule;
 import { ethers } from "ethers";
 import OpenAI from "openai";
 
@@ -25,8 +30,8 @@ export type ChatMessage = {
 // Broker singleton
 // ---------------------------------------------------------------------------
 
-let _broker: Awaited<ReturnType<typeof createZGServingNetworkBroker>> | null =
-  null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _broker: any = null;
 
 async function getBroker() {
   if (_broker) return _broker;

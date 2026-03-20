@@ -62,10 +62,7 @@ async function getClient(): Promise<Client> {
   if (_client) return _client;
 
   const transport = new StreamableHTTPClientTransport(new URL(MCP_URL));
-  const client = new Client(
-    { name: "nexus-gateway", version: "1.0.0" },
-    { capabilities: { tools: {} } }
-  );
+  const client = new Client({ name: "nexus-gateway", version: "1.0.0" });
 
   await client.connect(transport);
   console.log("[laguna] MCP client connected to", MCP_URL);
