@@ -1,90 +1,44 @@
 /**
  * broker.ts
  *
- * Wraps the 0G Compute Network broker (createZGComputeNetworkBroker) to provide
- * OpenAI-compatible chat completions using DeepSeek V3.
+ * Uses a pre-generated 0G Compute API key (app-sk-...) to call DeepSeek V3
+ * via the provider's OpenAI-compatible endpoint.
+ *
+ * No on-chain broker SDK needed — the API key handles auth directly.
  */
 
 import "dotenv/config";
-import { createRequire } from "module";
-import { ethers } from "ethers";
 import OpenAI from "openai";
-
-const require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const { createZGComputeNetworkBroker } = require("@0glabs/0g-serving-broker") as any;
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
 
-// ---------------------------------------------------------------------------
-// Broker singleton
-// ---------------------------------------------------------------------------
+let _client: OpenAI | null = null;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _broker: any = null;
+function getClient(): OpenAI {
+  if (_client) return _client;
 
-async function getBroker() {
-  if (_broker) return _broker;
+  const apiKey = process.env.ZG_API_KEY;
+  const endpoint = process.env.ZG_ENDPOINT;
 
-  const rpcUrl = process.env.ZG_RPC_URL;
-  const privateKey = process.env.PRIVATE_KEY;
+  if (!apiKey) throw new Error("ZG_API_KEY is not set");
+  if (!endpoint) throw new Error("ZG_ENDPOINT is not set");
 
-  if (!rpcUrl) throw new Error("ZG_RPC_URL is not set");
-  if (!privateKey) throw new Error("PRIVATE_KEY is not set");
-
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
-  const wallet = new ethers.Wallet(privateKey, provider);
-
-  _broker = await createZGComputeNetworkBroker(wallet);
-  console.log("[broker] 0G compute broker initialized");
-
-  // Log available providers so you can pick a valid ZG_PROVIDER_ADDRESS
-  try {
-    const services = await _broker.inference.listService();
-    console.log("[broker] Available providers on 0G network:");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    services.forEach((s: any) => {
-      console.log(`  provider=${s.provider}  model=${s.name ?? s.model ?? "?"}  url=${s.url ?? s.endpoint ?? "?"}`);
-    });
-  } catch (e) {
-    console.warn("[broker] Could not list services:", e);
-  }
-
-  return _broker;
+  _client = new OpenAI({ baseURL: endpoint, apiKey });
+  console.log("[broker] 0G client ready →", endpoint);
+  return _client;
 }
-
-// ---------------------------------------------------------------------------
-// Public inference function
-// ---------------------------------------------------------------------------
 
 export async function chat(
   messages: ChatMessage[],
   jsonMode = false
 ): Promise<string> {
-  const providerAddress = process.env.ZG_PROVIDER_ADDRESS;
-  if (!providerAddress) throw new Error("ZG_PROVIDER_ADDRESS is not set");
+  const model = process.env.ZG_SERVICE_NAME ?? "deepseek-chat-v3-0324";
+  const client = getClient();
 
-  const broker = await getBroker();
-
-  // 1. Get provider endpoint + model name
-  const { endpoint, model } = await broker.inference.getServiceMetadata(
-    providerAddress
-  );
-
-  // 2. Get signed request headers
-  const headers = await broker.inference.getRequestHeaders(providerAddress);
-
-  // 3. Call the OpenAI-compatible endpoint
-  const openai = new OpenAI({
-    baseURL: endpoint,
-    apiKey: "not-needed",
-    defaultHeaders: headers,
-  });
-
-  const completion = await openai.chat.completions.create({
+  const completion = await client.chat.completions.create({
     model,
     messages,
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
