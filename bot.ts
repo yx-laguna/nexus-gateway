@@ -16,6 +16,7 @@
  */
 
 import "dotenv/config";
+import { readFileSync, writeFileSync } from "fs";
 import { Bot, GrammyError, HttpError, type Context } from "grammy";
 import { processMessage, clearHistory } from "./agent.js";
 import { getDashboard } from "./laguna.js";
@@ -31,10 +32,26 @@ if (!token) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-user wallet store  (in-memory; swap for Redis/SQLite in production)
+// Per-user wallet store — persisted to wallets.json
 // ---------------------------------------------------------------------------
 
-const wallets = new Map<number, string>(); // userId → "0x..."
+const WALLETS_FILE = "./wallets.json";
+
+function loadWallets(): Map<number, string> {
+  try {
+    const raw = readFileSync(WALLETS_FILE, "utf8");
+    return new Map(Object.entries(JSON.parse(raw)).map(([k, v]) => [Number(k), v as string]));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveWallets(map: Map<number, string>) {
+  writeFileSync(WALLETS_FILE, JSON.stringify(Object.fromEntries(map)), "utf8");
+}
+
+const wallets = loadWallets();
+console.log(`[bot] Loaded ${wallets.size} saved wallet(s)`);
 
 function getWallet(userId: number): string | undefined {
   return wallets.get(userId);
@@ -42,6 +59,7 @@ function getWallet(userId: number): string | undefined {
 
 function setWallet(userId: number, address: string) {
   wallets.set(userId, address);
+  saveWallets(wallets);
 }
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
