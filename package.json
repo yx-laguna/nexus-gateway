@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "AI shopping agent Telegram bot powered by 0G Compute (DeepSeek V3) and Laguna affiliate tools",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "tsx --watch bot.ts",
     "start": "tsx bot.ts",
