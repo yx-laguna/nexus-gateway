@@ -12,12 +12,13 @@
  */
 
 import "dotenv/config";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-import ZGModule from "@0glabs/0g-serving-broker";
-// The package may export the factory as default or as a named member
+const ZGModule: any = require("@0glabs/0g-serving-broker");
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const createZGServingNetworkBroker: (signer: any) => Promise<any> =
-  (ZGModule as any).createZGServingNetworkBroker ?? ZGModule;
+  ZGModule.createZGServingNetworkBroker ?? ZGModule.default?.createZGServingNetworkBroker ?? ZGModule.default;
 import { ethers } from "ethers";
 import OpenAI from "openai";
 
