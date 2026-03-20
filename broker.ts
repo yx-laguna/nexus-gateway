@@ -40,6 +40,19 @@ async function getBroker() {
 
   _broker = await createZGComputeNetworkBroker(wallet);
   console.log("[broker] 0G compute broker initialized");
+
+  // Log available providers so you can pick a valid ZG_PROVIDER_ADDRESS
+  try {
+    const services = await _broker.inference.listService();
+    console.log("[broker] Available providers on 0G network:");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    services.forEach((s: any) => {
+      console.log(`  provider=${s.provider}  model=${s.name ?? s.model ?? "?"}  url=${s.url ?? s.endpoint ?? "?"}`);
+    });
+  } catch (e) {
+    console.warn("[broker] Could not list services:", e);
+  }
+
   return _broker;
 }
 
