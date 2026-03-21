@@ -204,6 +204,33 @@ bot.command("dashboard", async (ctx: Context) => {
 });
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const MAX_TG_LENGTH = 4096;
+
+async function sendLongMessage(ctx: Context, text: string) {
+  if (text.length <= MAX_TG_LENGTH) {
+    await ctx.reply(text, { parse_mode: "Markdown" });
+    return;
+  }
+  // Split on paragraph breaks where possible
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > MAX_TG_LENGTH) {
+    let splitAt = remaining.lastIndexOf("\n\n", MAX_TG_LENGTH);
+    if (splitAt === -1) splitAt = remaining.lastIndexOf("\n", MAX_TG_LENGTH);
+    if (splitAt === -1) splitAt = MAX_TG_LENGTH;
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  for (const chunk of chunks) {
+    await ctx.reply(chunk, { parse_mode: "Markdown" });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main message handler
 // ---------------------------------------------------------------------------
 
@@ -227,7 +254,7 @@ bot.on("message:text", async (ctx: Context) => {
 
   try {
     const reply = await processMessage(userId, text, wallet);
-    await ctx.reply(reply, { parse_mode: "Markdown" });
+    await sendLongMessage(ctx, reply);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unexpected error";
     console.error(`[bot] error for user ${userId}:`, errMsg);
