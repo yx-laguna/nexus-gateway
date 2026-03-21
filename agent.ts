@@ -38,25 +38,26 @@ const sessions = new Map<number, ChatMessage[]>();
 // System prompt — concierge-first, USDC as a footnote
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are Nexus, a personal travel and shopping concierge on Telegram.
+const SYSTEM_PROMPT = `You are Nexus, a friendly travel and shopping concierge on Telegram.
 
-## Your job
-Help users plan trips and make purchases. When a user shares a goal (destination, activity, item), break it into actionable steps and recommend specific options — then point them to the right platform to book or buy.
+## Default mode: conversation first
+- Chat naturally. Ask questions. Get to know what the user actually wants.
+- Do NOT jump to recommendations until the user's goal is clear.
+- One question at a time. Never interrogate.
 
-## Conversation style
-- If the user is asking a general travel question, answer it naturally and helpfully first.
-- If booking intent is clear, move straight to recommendations.
-- Ask follow-up questions only if critical info is missing (dates, number of travellers, budget).
-- Never ask more than ONE follow-up question at a time.
+## When to recommend
+Only present a full plan with links when you know:
+- Travel: destination + rough dates + number of travellers
+- Shopping: the item/category + rough budget or preference
+If any of these are missing, ask for the ONE most important missing piece.
 
-## When recommending
-- Be specific: real hotel names, airline routes, product models — not generic categories.
-- Include a rough price hint where possible.
-- Max 4 categories per reply. Most relevant ones only.
-- 150 words MAX. This is Telegram — keep it tight.
+## When recommending (goal is clear)
+- Lead with specific picks: real hotel names, airline routes, product models + price hints.
+- Max 4 categories. Most useful only. 150 words MAX.
+- After the picks, present the booking/purchase links.
 
-## Format (when making recommendations)
-[one-line goal confirm or conversational opener]
+## Format (only when goal is fully clear)
+[one-line natural confirm of what you're helping with]
 
 [emoji] *[Category]* — [specific pick + price hint]
 → [Platform]: [affiliate link OR direct platform URL]
@@ -67,9 +68,14 @@ _Book through these links and save a little too 💸_
 PS: [one-line cashback note if applicable]
 
 ## Link rules
-- Use affiliate links ONLY when explicitly provided in tool results — never fabricate.
-- If no affiliate link: use the real platform URL (agoda.com, trip.com, klook.com, etc).
-- Cashback is always a PS at the end — never the headline.`;
+- Use affiliate links ONLY when explicitly provided in tool results — never fabricate URLs.
+- No affiliate link available? Use the real homepage (agoda.com, trip.com, klook.com, iherb.com, etc).
+- Cashback is always the PS, never the headline.
+
+## Off-topic
+If the message has nothing to do with travel or shopping, gently steer back:
+"I'm best at helping you plan trips and find deals — what are you looking for?"`;
+
 
 function getHistory(userId: number): ChatMessage[] {
   if (!sessions.has(userId)) {
@@ -119,7 +125,8 @@ async function extractIntent(
   history: ChatMessage[],
   userMessage: string
 ): Promise<GoalIntent> {
-  const nonSystemHistory = history.filter((m) => m.role !== "system");
+  // Only pass last 4 turns to keep this call cheap
+  const nonSystemHistory = history.filter((m) => m.role !== "system").slice(-4);
 
   const prompt: ChatMessage[] = [
     {
@@ -183,18 +190,15 @@ Max 4 categories. Output JSON only.`,
   try {
     return GoalIntentSchema.parse(JSON.parse(raw));
   } catch {
+    // Safe fallback — treat as a general question, never fabricate a search
+    console.warn("[agent] intent parse failed, falling back to general_question. Raw:", raw.slice(0, 200));
     return {
       goal: userMessage,
-      categories: [
-        {
-          label: "Deals",
-          recommendations: [userMessage],
-          platform_search: userMessage,
-          category: "retail",
-        },
-      ],
+      intent: "general_question",
+      categories: [],
       is_dashboard_query: false,
       is_off_topic: false,
+      needs_clarification: false,
     };
   }
 }
@@ -377,26 +381,52 @@ export async function processMessage(
   history.push({ role: "user", content: text });
 
   try {
-    const intent = await extractIntent(history, text);
+    // Skip intent extraction for short casual messages — saves an LLM call
+    const isCasual = text.trim().split(/\s+/).length <= 4 && !/hotel|flight|book|buy|shop|trip|travel|order|plan|stay|rent/i.test(text);
 
     let reply: string;
 
-    if (intent.is_off_topic) {
-      reply = "I'm a travel and shopping concierge — I'm best at helping you plan trips and find deals. What are you looking for?";
-    } else if (intent.is_dashboard_query) {
-      reply = "Use /dashboard to check your affiliate earnings and cashback history.";
-    } else if (intent.needs_clarification && intent.clarification_question) {
-      // Missing critical info — ask ONE question before searching
-      reply = intent.clarification_question;
-    } else if (intent.intent === "general_question" || intent.categories.length === 0) {
-      // Conversational travel/shopping question — answer naturally
+    if (isCasual) {
       const messages: ChatMessage[] = [
         { role: "system", content: SYSTEM_PROMPT },
         ...history.filter((m) => m.role !== "system"),
       ];
       reply = await chat(messages);
+      const cleanReply = reply.slice(0, 1200);
+      history.push({ role: "assistant", content: cleanReply });
+      if (history.length > 21) history.splice(1, history.length - 21);
+      return reply;
+    }
+
+    const intent = await extractIntent(history, text);
+
+    const isActionable =
+      (intent.intent === "travel_booking" || intent.intent === "retail_shopping" || intent.intent === "product_comparison") &&
+      !intent.needs_clarification &&
+      intent.categories.length > 0;
+
+    if (intent.is_dashboard_query) {
+      reply = "Use /dashboard to check your affiliate earnings and cashback history.";
+
+    } else if (intent.is_off_topic) {
+      // Let the model respond naturally and steer back
+      const messages: ChatMessage[] = [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history.filter((m) => m.role !== "system"),
+      ];
+      reply = await chat(messages);
+
+    } else if (!isActionable) {
+      // General chat, missing info, or unclear intent — keep the conversation going
+      const messages: ChatMessage[] = [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history.filter((m) => m.role !== "system"),
+      ];
+      reply = await chat(messages);
+
     } else {
-      // Booking or shopping intent — search Laguna + mint links
+      // Intent is clear and complete — call Laguna, mint links, present plan
+      console.log(`[agent] intent confirmed: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")}`);
       const enriched = await runTools(intent, walletAddress);
       reply = await composeResponse(history, text, intent, enriched);
     }
