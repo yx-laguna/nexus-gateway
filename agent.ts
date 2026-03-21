@@ -41,36 +41,34 @@ const sessions = new Map<number, ChatMessage[]>();
 const SYSTEM_PROMPT = `/no_think
 You are Nexus, a personal travel and shopping concierge on Telegram.
 
-## Cardinal rule: BREVITY
-This is a mobile chat interface. Users scroll fast and lose interest in long messages.
-- Hard limit: 180 words per reply.
-- Max 4 categories per response. Pick the most important ones.
-- Each category: 1 specific recommendation + 1 platform link. That's it.
-- No intros, no filler, no "Great choice!". Get straight to the picks.
+## cardinal rule: BREVITY
+Mobile chat. Users lose interest fast.
+- 150 words MAX. No exceptions.
+- Max 4 categories. Pick the most useful ones.
+- No intros, no "Great choice!", no filler. Start with the first pick immediately.
+- Never show reasoning, analysis, or planning steps. Just the reply.
 
 ## Tone
-- Confident and specific: "The Layar Villa in Seminyak, ~$150/night" not "there are some nice hotels".
-- Like a well-travelled friend texting you their honest picks.
-- Cashback is a PS at the end, never the headline.
+- Specific and confident: "Layar Villa, Seminyak — ~$150/night" not "some nice hotels".
+- Like a well-travelled friend texting their honest picks.
+- Cashback is a one-line PS at the very end, never the headline.
 
-## Format (stick to this exactly)
+## Format
 [one-line goal confirm]
 
-✈️ *Flights* — [specific route/airline, price hint]
-→ Book on [Platform]: [link or "ask me for the link"]
-
-🏨 *Hotels* — [specific property, neighbourhood, price]
-→ Book on [Platform]: [link or "ask me for the link"]
+[emoji] *[Category]* — [specific pick + price hint]
+→ [Platform name]: [affiliate link if provided, otherwise direct website URL]
 
 [repeat for up to 4 categories]
 
-_Book via these links and save a little too 💸_
+_[one-liner about savings] 💸_
 
 ## Rules
-- ONLY use affiliate links from tool results — never fabricate URLs.
-- If no link: name the platform and say "reply 'link' and I'll grab it".
-- Never say "no results". Always give a real pick.
-- 180 words max. Every word earns its place.`;
+- Affiliate links: use ONLY links explicitly provided in tool results.
+- No affiliate link found: use the platform's real homepage URL (e.g. agoda.com, klook.com). Never ask the user to "reply for a link" — just give the URL.
+- Never ask for permission. Never wait. Just recommend and link.
+- Never show thinking, analysis steps, or numbered reasoning.
+- 150 words max.`;
 
 function getHistory(userId: number): ChatMessage[] {
   if (!sessions.has(userId)) {
@@ -284,14 +282,38 @@ async function composeResponse(
     })
     .join("\n\n");
 
+  // Build fallback URLs for platforms without affiliate links
+  const platformUrls: Record<string, string> = {
+    "agoda": "https://agoda.com",
+    "booking.com": "https://booking.com",
+    "trip.com": "https://trip.com",
+    "airasia": "https://airasia.com",
+    "skyscanner": "https://skyscanner.com",
+    "klook": "https://klook.com",
+    "zalora": "https://zalora.com",
+    "asos": "https://asos.com",
+    "nike": "https://nike.com",
+    "adidas": "https://adidas.com",
+    "iherb": "https://iherb.com",
+    "lazada": "https://lazada.com",
+    "amazon": "https://amazon.com",
+    "uniqlo": "https://uniqlo.com",
+    "sephora": "https://sephora.com",
+  };
+
   const unmatchedBlock = intent.categories
     .filter((cat) => !enrichedLabels.has(cat.label))
-    .map(
-      (cat) =>
+    .map((cat) => {
+      const key = cat.platform_search.toLowerCase();
+      const fallbackUrl = Object.entries(platformUrls).find(([k]) =>
+        key.includes(k)
+      )?.[1] ?? `https://${key.replace(/\s+/g, "")}.com`;
+      return (
         `[${cat.label}]\n` +
         `Recommendations: ${cat.recommendations.join(" | ")}\n` +
-        `Platform to suggest: ${cat.platform_search} (no affiliate link yet — name the platform and offer to get a deal link)`
-    )
+        `Platform: ${cat.platform_search} — use this URL directly: ${fallbackUrl}`
+      );
+    })
     .join("\n\n");
 
   const compositionMessages: ChatMessage[] = [
@@ -308,12 +330,13 @@ ${matchedBlock || "None found."}
 == CATEGORIES WITHOUT LINKS YET ==
 ${unmatchedBlock || "None."}
 
-Write a Telegram reply following the system prompt format EXACTLY.
-- 180 words MAX — cut ruthlessly.
-- Pick the top 3–4 categories only.
-- One specific pick per category, then the platform + link on the next line.
-- No fluff, no long intros, no "Great question!".
-- Cashback as a one-line PS at the very end.`,
+Write the Telegram reply now. Follow the system prompt format EXACTLY.
+- 150 words MAX.
+- Top 3–4 categories only.
+- One specific pick per category + the URL on the next line.
+- Use affiliate links where provided. Use the fallback URL where not. Never ask the user for anything.
+- No thinking, no analysis, no numbered steps — output the reply only.
+- Cashback as one PS line at the very end.`,
     },
   ];
 
@@ -350,7 +373,9 @@ export async function processMessage(
       reply = await composeResponse(history, text, intent, enriched);
     }
 
-    history.push({ role: "assistant", content: reply });
+    // Store only the clean reply — never let thinking content pollute history
+    const cleanReply = reply.slice(0, 1200); // cap stored turn to avoid ballooning context
+    history.push({ role: "assistant", content: cleanReply });
 
     // Keep system prompt + last 20 turns
     if (history.length > 21) {

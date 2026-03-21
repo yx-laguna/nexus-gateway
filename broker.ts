@@ -10,6 +10,48 @@
 import "dotenv/config";
 import OpenAI from "openai";
 
+/**
+ * Strip reasoning/thinking content from Qwen3 and similar models.
+ * Handles: <think>...</think>, unclosed <think>, and raw "Thinking Process:" dumps.
+ */
+function stripThinking(raw: string): string {
+  let out = raw;
+
+  // Remove complete <think>...</think> blocks (greedy — handles nested content)
+  out = out.replace(/<think>[\s\S]*?<\/think>/gi, "");
+
+  // Remove unclosed <think> blocks — everything from <think> to end of string
+  out = out.replace(/<think>[\s\S]*/gi, "");
+
+  // Remove lines that look like raw reasoning dumps
+  const reasoningPatterns = [
+    /^(Thinking Process|Chain of Thought|Let me think|Step \d+[:.])[\s\S]*/im,
+    /^\d+\.\s+(Analyze|Consider|Think|Review|Plan|Draft|Refine|Check|Final Polish)[\s\S]*/im,
+  ];
+  for (const pattern of reasoningPatterns) {
+    const match = out.search(pattern);
+    if (match !== -1) {
+      // Only cut if the actual reply content starts before this reasoning block
+      const before = out.slice(0, match).trim();
+      if (before.length > 0) {
+        out = before;
+      } else {
+        // Reasoning is at the top — find where the real reply starts
+        // (look for emoji or a short line after the reasoning block)
+        const lines = out.split("\n");
+        const firstContentLine = lines.findIndex(
+          (l) => l.trim().length > 0 && !/^\d+\./.test(l.trim())
+        );
+        if (firstContentLine > 0) {
+          out = lines.slice(firstContentLine).join("\n");
+        }
+      }
+    }
+  }
+
+  return out.trim();
+}
+
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
@@ -52,7 +94,5 @@ export async function chat(
   });
 
   const raw = completion.choices[0]?.message?.content ?? "";
-
-  // Fallback: strip any <think>...</think> blocks that still leak through
-  return raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return stripThinking(raw);
 }
