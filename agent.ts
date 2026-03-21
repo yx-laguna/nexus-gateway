@@ -40,27 +40,36 @@ const sessions = new Map<number, ChatMessage[]>();
 
 const SYSTEM_PROMPT = `You are Nexus, a personal travel and shopping concierge on Telegram.
 
-## Output rules
-- 150 words MAX. Mobile screen, short attention span.
-- Max 4 categories. Most useful ones only.
-- Zero filler: no "Great!", no "Sure!", no intros. First word = first recommendation.
-- Cashback is a one-line PS at the very end, never the headline.
+## Your job
+Help users plan trips and make purchases. When a user shares a goal (destination, activity, item), break it into actionable steps and recommend specific options — then point them to the right platform to book or buy.
 
-## Format (follow exactly)
-[one-line goal confirm]
+## Conversation style
+- If the user is asking a general travel question, answer it naturally and helpfully first.
+- If booking intent is clear, move straight to recommendations.
+- Ask follow-up questions only if critical info is missing (dates, number of travellers, budget).
+- Never ask more than ONE follow-up question at a time.
+
+## When recommending
+- Be specific: real hotel names, airline routes, product models — not generic categories.
+- Include a rough price hint where possible.
+- Max 4 categories per reply. Most relevant ones only.
+- 150 words MAX. This is Telegram — keep it tight.
+
+## Format (when making recommendations)
+[one-line goal confirm or conversational opener]
 
 [emoji] *[Category]* — [specific pick + price hint]
-→ [Platform]: [affiliate link OR platform homepage URL]
+→ [Platform]: [affiliate link OR direct platform URL]
 
 [repeat for up to 4 categories]
 
-_[one savings line] 💸_
-PS: [cashback note if relevant]
+_Book through these links and save a little too 💸_
+PS: [one-line cashback note if applicable]
 
 ## Link rules
-- Use affiliate links ONLY if explicitly provided in tool results.
-- No affiliate link? Use the real platform URL (e.g. agoda.com, trip.com). Never ask the user to request one.
-- Never fabricate URLs.`;
+- Use affiliate links ONLY when explicitly provided in tool results — never fabricate.
+- If no affiliate link: use the real platform URL (agoda.com, trip.com, klook.com, etc).
+- Cashback is always a PS at the end — never the headline.`;
 
 function getHistory(userId: number): ChatMessage[] {
   if (!sessions.has(userId)) {
@@ -95,9 +104,11 @@ const CategorySchema = z.object({
 
 const GoalIntentSchema = z.object({
   goal: z.string(),
-  categories: z.array(CategorySchema).min(1).max(6),
-  /** ISO 3166-1 alpha-2 if a country/region is mentioned */
+  intent: z.enum(["travel_booking", "retail_shopping", "product_comparison", "general_question", "dashboard", "off_topic"]).default("general_question"),
+  categories: z.array(CategorySchema).default([]),
   geo: z.string().length(2).optional(),
+  needs_clarification: z.boolean().default(false),
+  clarification_question: z.string().optional(),
   is_dashboard_query: z.boolean().default(false),
   is_off_topic: z.boolean().default(false),
 });
@@ -113,44 +124,55 @@ async function extractIntent(
   const prompt: ChatMessage[] = [
     {
       role: "system",
-      content: `You are a goal-decomposition and recommendation engine for a travel and retail concierge.
+      content: `You are an intent detection and goal-decomposition engine for a travel and retail concierge.
 
-Given the user's message, output ONLY valid JSON:
+## Intent detection (pick ONE)
+- "travel_booking": user wants to book flights, hotels, car rentals, activities, or plan a trip. Triggers: "book", "fly to", "stay in", "hotel in", "trip to", "visit", "vacation", "holiday", destination names.
+- "retail_shopping": user wants to buy a product. Triggers: "buy", "shop for", "get me", "looking for" + item.
+- "product_comparison": user is comparing options. Triggers: "compare", "which is better", "vs", "difference between".
+- "general_question": travel or shopping question with no purchase intent. Answer conversationally — set categories to [].
+- "dashboard": user asks about their earnings, cashback, commissions. Set is_dashboard_query: true.
+- "off_topic": nothing to do with travel or shopping. Set is_off_topic: true.
+
+If multiple intents, choose the most explicit one. If unclear, treat as "general_question".
+
+## Output — ONLY valid JSON, no explanation:
 {
   "goal": string,
+  "intent": "travel_booking" | "retail_shopping" | "product_comparison" | "general_question" | "dashboard" | "off_topic",
   "categories": [
     {
       "label": string,              // e.g. "Flights", "Hotels", "Running Shoes", "Supplements"
-      "recommendations": [string],  // 2–3 SPECIFIC items: hotel names, product names, brands, routes
-      "platform_search": string,    // specific platform to search: "agoda", "trip.com", "klook", "nike", "iherb", "zalora", "asos"
+      "recommendations": [string],  // 2–3 SPECIFIC items with real names + price hints
+      "platform_search": string,    // exact platform slug to search: "agoda", "trip.com", "klook", "nike", "iherb", "zalora", "asos", "booking.com", "airasia"
       "category": string            // one of: travel, fashion, electronics, health, retail
     }
   ],
-  "geo": string|null,
+  "geo": string|null,               // ISO 3166-1 alpha-2 if a country/region is mentioned
+  "needs_clarification": bool,      // true if critical info is missing (destination, dates, budget)
+  "clarification_question": string, // ONE question to ask if needs_clarification is true
   "is_dashboard_query": bool,
   "is_off_topic": bool
 }
 
-## Recommendation rules
-Be SPECIFIC. Use real names the user will recognise:
-- Hotels: actual property names + neighbourhood + rough price, e.g. "The Layar Villa, Seminyak (~$150/night)"
-- Flights: route + airline, e.g. "AirAsia direct KUL→DPS (from ~$80)"
-- Activities: named tours, e.g. "Ubud Rice Terrace & Monkey Forest half-day (Klook, ~$25)"
+## Recommendation rules — be SPECIFIC:
+- Hotels: real property names + neighbourhood + price, e.g. "Pullman Jakarta Central Park, Thamrin (~$120/night)"
+- Flights: airline + route, e.g. "Garuda Indonesia CGK→NBO (from ~$650 return)"
+- Activities: named tours + platform, e.g. "Bali Swing & Ubud Tour via Klook (~$35)"
 - Running shoes: model names, e.g. "Nike Pegasus 41", "Adidas Ultraboost 24"
-- Supplements: brand + product, e.g. "Optimum Nutrition Gold Standard Whey", "NOW Foods Vitamin C"
+- Supplements: brand + product, e.g. "Optimum Nutrition Gold Standard Whey"
 - Fashion: brand + item, e.g. "Uniqlo AIRism T-shirt", "Levi's 511 slim jeans"
 
-## Platform search rules (platform_search field)
-Search specific platform names — NOT generic terms:
-- Flights: "airasia", "trip.com"
-- Hotels: "agoda", "booking.com", "trip.com"
-- Activities: "klook"
-- Fashion: "zalora", "asos", "nike", "adidas", "uniqlo"
-- Health/supplements: "iherb"
-- Electronics: "samsung", "lenovo", "dyson"
-- General: "lazada", "amazon"
+## Platform search slugs:
+- Flights → "airasia", "trip.com"
+- Hotels → "agoda", "trip.com", "booking.com"
+- Activities → "klook"
+- Fashion → "zalora", "asos", "nike", "adidas", "uniqlo"
+- Health → "iherb"
+- Electronics → "samsung", "lenovo", "dyson"
+- General → "lazada", "amazon"
 
-Max 6 categories. No explanation — only the JSON object.`,
+Max 4 categories. Output JSON only.`,
     },
     ...nonSystemHistory.slice(-6),
     { role: "user", content: userMessage },
@@ -216,8 +238,12 @@ async function runTools(
   }> = [];
 
   for (const result of searchResults) {
-    if (result.status !== "fulfilled") continue;
+    if (result.status !== "fulfilled") {
+      console.error("[agent] merchant search failed:", result.reason);
+      continue;
+    }
     const { cat, merchants } = result.value;
+    console.log(`[agent] search "${cat.platform_search}" → ${merchants.length} result(s):`, merchants.map((m) => m.id));
     for (const m of merchants.slice(0, 1)) {
       if (seen.has(m.id)) continue;
       seen.add(m.id);
@@ -237,15 +263,18 @@ async function runTools(
         getMerchantInfo({ merchant_id: merchantId, geo }),
         mintLink({ merchant_id: merchantId, geo, wallet_address: walletAddress }),
       ]);
+      console.log(`[agent] minted link for ${merchantId}:`, link.shortlink);
       return { label, recommendations, info, link } satisfies EnrichedCategory;
     })
   );
 
   return enriched
-    .filter(
-      (r): r is PromiseFulfilledResult<EnrichedCategory> =>
-        r.status === "fulfilled"
-    )
+    .filter((r): r is PromiseFulfilledResult<EnrichedCategory> => {
+      if (r.status !== "fulfilled") {
+        console.error("[agent] mint/info failed:", (r as PromiseRejectedResult).reason);
+      }
+      return r.status === "fulfilled";
+    })
     .map((r) => r.value);
 }
 
@@ -327,7 +356,7 @@ Write the Telegram reply now. Follow the system prompt format EXACTLY.
 - Top 3–4 categories only.
 - One specific pick per category + the URL on the next line.
 - Use affiliate links where provided. Use the fallback URL where not. Never ask the user for anything.
-- No thinking, no analysis, no numbered steps — output the reply only.
+- Output the reply only. No reasoning steps, no preamble, no meta-commentary.
 - Cashback as one PS line at the very end.`,
     },
   ];
@@ -353,19 +382,26 @@ export async function processMessage(
     let reply: string;
 
     if (intent.is_off_topic) {
+      reply = "I'm a travel and shopping concierge — I'm best at helping you plan trips and find deals. What are you looking for?";
+    } else if (intent.is_dashboard_query) {
+      reply = "Use /dashboard to check your affiliate earnings and cashback history.";
+    } else if (intent.needs_clarification && intent.clarification_question) {
+      // Missing critical info — ask ONE question before searching
+      reply = intent.clarification_question;
+    } else if (intent.intent === "general_question" || intent.categories.length === 0) {
+      // Conversational travel/shopping question — answer naturally
       const messages: ChatMessage[] = [
         { role: "system", content: SYSTEM_PROMPT },
         ...history.filter((m) => m.role !== "system"),
       ];
       reply = await chat(messages);
-    } else if (intent.is_dashboard_query) {
-      reply = "Use /dashboard to check your savings and cashback history.";
     } else {
+      // Booking or shopping intent — search Laguna + mint links
       const enriched = await runTools(intent, walletAddress);
       reply = await composeResponse(history, text, intent, enriched);
     }
 
-    // Store only the clean reply — never let thinking content pollute history
+    // Cap stored reply to prevent context ballooning over long sessions
     const cleanReply = reply.slice(0, 1200); // cap stored turn to avoid ballooning context
     history.push({ role: "assistant", content: cleanReply });
 

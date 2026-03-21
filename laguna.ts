@@ -2,8 +2,10 @@
  * laguna.ts
  *
  * Direct HTTP client for the Laguna affiliate MCP server.
- * Calls the MCP JSON-RPC endpoint at LAGUNA_MCP_URL via plain fetch —
- * no SDK transport layer, no silent failures.
+ *
+ * MCP Streamable HTTP requires:
+ *   1. POST /mcp with "initialize" → server returns Mcp-Session-Id header
+ *   2. All subsequent calls include that session header
  *
  * Tools:
  *   • search_merchants   – find merchants by query / category
@@ -22,6 +24,8 @@ const MCP_URL =
   process.env.LAGUNA_MCP_URL ?? "https://agents-dev.laguna.network/mcp";
 
 let _requestId = 1;
+let _sessionId: string | null = null;
+let _initPromise: Promise<void> | null = null;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,25 +61,22 @@ export interface Dashboard {
 }
 
 // ---------------------------------------------------------------------------
-// Core JSON-RPC caller
+// MCP session initializer
 // ---------------------------------------------------------------------------
 
-async function callTool<T>(
-  toolName: string,
-  args: Record<string, unknown>
-): Promise<T> {
-  const id = _requestId++;
+async function initSession(): Promise<void> {
   const body = {
     jsonrpc: "2.0",
-    id,
-    method: "tools/call",
+    id: _requestId++,
+    method: "initialize",
     params: {
-      name: toolName,
-      arguments: args,
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "nexus-gateway", version: "1.0.0" },
     },
   };
 
-  console.log(`[laguna] → ${toolName}`, JSON.stringify(args));
+  console.log("[laguna] initializing MCP session at", MCP_URL);
 
   const res = await fetch(MCP_URL, {
     method: "POST",
@@ -88,42 +89,106 @@ async function callTool<T>(
 
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText);
+    throw new Error(`[laguna] init HTTP ${res.status}: ${errText}`);
+  }
+
+  // Capture session ID if server returns one
+  const sessionId = res.headers.get("mcp-session-id");
+  if (sessionId) {
+    _sessionId = sessionId;
+    console.log("[laguna] session established:", sessionId);
+  } else {
+    console.log("[laguna] no session ID returned — server may not require one");
+  }
+
+  // Send initialized notification
+  await fetch(MCP_URL, {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    }),
+  }).catch(() => {
+    /* notification is fire-and-forget */
+  });
+}
+
+function buildHeaders(): Record<string, string> {
+  const h: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+  };
+  if (_sessionId) h["mcp-session-id"] = _sessionId;
+  return h;
+}
+
+async function ensureSession(): Promise<void> {
+  if (_sessionId !== null) return;
+  if (!_initPromise) _initPromise = initSession();
+  await _initPromise;
+}
+
+// ---------------------------------------------------------------------------
+// Core JSON-RPC caller
+// ---------------------------------------------------------------------------
+
+async function callTool<T>(
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<T> {
+  await ensureSession();
+
+  const id = _requestId++;
+  const body = {
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: toolName, arguments: args },
+  };
+
+  console.log(`[laguna] → ${toolName}`, JSON.stringify(args));
+
+  const res = await fetch(MCP_URL, {
+    method: "POST",
+    headers: buildHeaders(),
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText);
     throw new Error(`[laguna] ${toolName} HTTP ${res.status}: ${errText}`);
   }
 
   const contentType = res.headers.get("content-type") ?? "";
+  const rawText = contentType.includes("text/event-stream")
+    ? await readSSE(res)
+    : await res.text();
 
-  let responseText: string;
+  console.log(`[laguna] ← ${toolName} raw:`, rawText.slice(0, 300));
 
-  if (contentType.includes("text/event-stream")) {
-    // SSE stream — collect all data: lines and concatenate
-    responseText = await readSSE(res);
-  } else {
-    responseText = await res.text();
-  }
-
-  // Parse outer JSON-RPC envelope
+  // Parse JSON-RPC envelope
   let envelope: {
     result?: { content?: Array<{ type: string; text: string }> };
     error?: { message: string };
   };
 
   try {
-    envelope = JSON.parse(responseText);
+    envelope = JSON.parse(rawText);
   } catch {
-    // Some responses are raw JSON (not wrapped in JSON-RPC envelope)
     try {
-      return JSON.parse(responseText) as T;
+      return JSON.parse(rawText) as T;
     } catch {
-      throw new Error(`[laguna] ${toolName} unparseable response: ${responseText.slice(0, 200)}`);
+      throw new Error(
+        `[laguna] ${toolName} unparseable response: ${rawText.slice(0, 300)}`
+      );
     }
   }
 
   if (envelope.error) {
-    throw new Error(`[laguna] ${toolName} error: ${envelope.error.message}`);
+    throw new Error(`[laguna] ${toolName} RPC error: ${envelope.error.message}`);
   }
 
-  // Extract text content from MCP result
   const content = envelope.result?.content;
   if (!Array.isArray(content) || content.length === 0) {
     throw new Error(`[laguna] ${toolName} returned empty content`);
@@ -134,7 +199,7 @@ async function callTool<T>(
     .map((c) => c.text)
     .join("\n");
 
-  console.log(`[laguna] ← ${toolName}`, text.slice(0, 200));
+  console.log(`[laguna] ← ${toolName} parsed:`, text.slice(0, 300));
 
   try {
     return JSON.parse(text) as T;
@@ -144,28 +209,25 @@ async function callTool<T>(
 }
 
 // ---------------------------------------------------------------------------
-// SSE reader — collects "data:" lines from a streaming response
+// SSE reader
 // ---------------------------------------------------------------------------
 
 async function readSSE(res: Response): Promise<string> {
   const text = await res.text();
-  const lines = text.split("\n");
-  const dataLines = lines
+  const dataLines = text
+    .split("\n")
     .filter((l) => l.startsWith("data:"))
     .map((l) => l.slice(5).trim())
     .filter((l) => l && l !== "[DONE]");
 
-  // Return last non-empty data line (the final JSON-RPC result)
   for (let i = dataLines.length - 1; i >= 0; i--) {
-    const line = dataLines[i];
     try {
-      JSON.parse(line); // validate it's parseable
-      return line;
+      JSON.parse(dataLines[i]);
+      return dataLines[i];
     } catch {
       continue;
     }
   }
-
   return dataLines.join("\n");
 }
 
@@ -173,7 +235,6 @@ async function readSSE(res: Response): Promise<string> {
 // Public tool functions
 // ---------------------------------------------------------------------------
 
-/** Search or browse affiliate merchants by query and/or category. */
 export async function searchMerchants(params: {
   query?: string;
   category?: string;
@@ -185,29 +246,20 @@ export async function searchMerchants(params: {
     "search_merchants",
     params as Record<string, unknown>
   );
-
   if (Array.isArray(raw)) return raw;
-  if (raw && typeof raw === "object" && "merchants" in raw && Array.isArray(raw.merchants)) {
-    return raw.merchants;
+  if (raw && typeof raw === "object" && "merchants" in raw && Array.isArray((raw as { merchants: Merchant[] }).merchants)) {
+    return (raw as { merchants: Merchant[] }).merchants;
   }
   return [];
 }
 
-/** Get detailed rates and info for a specific merchant. */
 export async function getMerchantInfo(params: {
   merchant_id: string;
   geo?: string;
 }): Promise<MerchantInfo> {
-  return callTool<MerchantInfo>(
-    "get_merchant_info",
-    params as Record<string, unknown>
-  );
+  return callTool<MerchantInfo>("get_merchant_info", params as Record<string, unknown>);
 }
 
-/**
- * Mint a tracked affiliate shortlink for a merchant.
- * wallet_address is the user's EVM address — commissions go there directly.
- */
 export async function mintLink(params: {
   merchant_id: string;
   wallet_address?: string;
@@ -216,33 +268,27 @@ export async function mintLink(params: {
   target_url?: string;
 }): Promise<MintedLink> {
   const args: Record<string, unknown> = { ...params };
-
-  // Fallback to operator env vars if user hasn't set a wallet
   if (!args.wallet_address && process.env.LAGUNA_WALLET_ADDRESS) {
     args.wallet_address = process.env.LAGUNA_WALLET_ADDRESS;
   }
   if (!args.email && process.env.LAGUNA_EMAIL) {
     args.email = process.env.LAGUNA_EMAIL;
   }
-
   console.log(`[laguna] minting link for ${params.merchant_id} → wallet ${args.wallet_address}`);
   return callTool<MintedLink>("mint_link", args);
 }
 
-/** Fetch dashboard: balance + conversion history for a wallet. */
 export async function getDashboard(params?: {
   wallet_address?: string;
   email?: string;
   include?: string[];
 }): Promise<Dashboard> {
   const args: Record<string, unknown> = { ...(params ?? {}) };
-
   if (!args.wallet_address && process.env.LAGUNA_WALLET_ADDRESS) {
     args.wallet_address = process.env.LAGUNA_WALLET_ADDRESS;
   }
   if (!args.email && process.env.LAGUNA_EMAIL) {
     args.email = process.env.LAGUNA_EMAIL;
   }
-
   return callTool<Dashboard>("get_dashboard", args);
 }
