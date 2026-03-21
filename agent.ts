@@ -38,7 +38,8 @@ const sessions = new Map<number, ChatMessage[]>();
 // System prompt — concierge-first, USDC as a footnote
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are Nexus, a personal travel and shopping concierge on Telegram.
+const SYSTEM_PROMPT = `/no_think
+You are Nexus, a personal travel and shopping concierge on Telegram.
 
 ## Cardinal rule: BREVITY
 This is a mobile chat interface. Users scroll fast and lose interest in long messages.

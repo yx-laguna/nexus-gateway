@@ -42,10 +42,17 @@ export async function chat(
     model,
     messages,
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+    // Disable Qwen3 thinking mode — direct answers only, no reasoning trace
+    ...({
+      extra_body: {
+        enable_thinking: false,
+        chat_template_kwargs: { enable_thinking: false },
+      },
+    } as object),
   });
 
   const raw = completion.choices[0]?.message?.content ?? "";
-  // Qwen3.5 and other reasoning models emit <think>...</think> blocks.
-  // Strip them so only the final answer reaches the user.
+
+  // Fallback: strip any <think>...</think> blocks that still leak through
   return raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
