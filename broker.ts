@@ -44,5 +44,8 @@ export async function chat(
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
 
-  return completion.choices[0]?.message?.content ?? "";
+  const raw = completion.choices[0]?.message?.content ?? "";
+  // Qwen3.5 and other reasoning models emit <think>...</think> blocks.
+  // Strip them so only the final answer reaches the user.
+  return raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }

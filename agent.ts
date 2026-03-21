@@ -1,24 +1,21 @@
 /**
  * agent.ts
  *
- * Core shopping agent logic.
+ * Pipeline:
  *
- * Two-step reasoning pipeline:
+ *   Step 1 — Goal decomposition + SKU recommendations (LLM → JSON)
+ *     Given any goal ("trip to Bali", "get fit", "buy running shoes"), the model
+ *     breaks it into categories, recommends SPECIFIC products/hotels/brands per
+ *     category, and maps each to a platform to search in Laguna.
  *
- *   Step 1 — Intent extraction (DeepSeek V3 → structured JSON)
- *     DeepSeek reads the conversation and outputs a ShoppingIntent object that
- *     describes what the user wants to buy, the preferred category, country,
- *     and any budget constraints.
+ *   Step 2 — Parallel merchant lookup + link minting (Node → Laguna MCP)
+ *     Each platform is searched in parallel. Top results get merchant info
+ *     fetched and affiliate links minted, all tied to the user's wallet.
  *
- *   Step 2 — Tool execution (Node → Laguna MCP)
- *     The intent drives direct calls to Laguna's affiliate tools:
- *       • search_merchants  – find relevant merchants
- *       • get_merchant_info – fetch cashback rates for top picks
- *       • mint_link         – generate tracked shortlinks per merchant
- *
- *   Step 3 — Response composition (DeepSeek V3 → Markdown reply)
- *     DeepSeek receives the raw tool results and writes a friendly, ranked
- *     reply with links and USDC cashback figures.
+ *   Step 3 — Plan composition (LLM → Markdown reply)
+ *     The model writes a reply that leads with specific recommendations
+ *     (hotels, products, brands), then tells the user where to book/buy them
+ *     with real affiliate links. Cashback is a light bonus at the end.
  */
 
 import { chat, type ChatMessage } from "./broker.js";
@@ -26,22 +23,53 @@ import {
   searchMerchants,
   getMerchantInfo,
   mintLink,
-  type Merchant,
   type MerchantInfo,
   type MintedLink,
 } from "./laguna.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
-// Session store  (in-memory; replace with Redis/DB for production)
+// Session store
 // ---------------------------------------------------------------------------
 
 const sessions = new Map<number, ChatMessage[]>();
 
-const SYSTEM_PROMPT = `You are Nexus, an expert AI shopping assistant.
-Your goal is to find the best online merchants, cashback deals, and affiliate offers for users.
-Be concise, friendly, and always highlight cashback/USDC earnings prominently.
-When you have merchant data and links, present them in a clear ranked list.`;
+// ---------------------------------------------------------------------------
+// System prompt — concierge-first, USDC as a footnote
+// ---------------------------------------------------------------------------
+
+const SYSTEM_PROMPT = `You are Nexus, a personal travel and shopping concierge on Telegram.
+
+## Cardinal rule: BREVITY
+This is a mobile chat interface. Users scroll fast and lose interest in long messages.
+- Hard limit: 180 words per reply.
+- Max 4 categories per response. Pick the most important ones.
+- Each category: 1 specific recommendation + 1 platform link. That's it.
+- No intros, no filler, no "Great choice!". Get straight to the picks.
+
+## Tone
+- Confident and specific: "The Layar Villa in Seminyak, ~$150/night" not "there are some nice hotels".
+- Like a well-travelled friend texting you their honest picks.
+- Cashback is a PS at the end, never the headline.
+
+## Format (stick to this exactly)
+[one-line goal confirm]
+
+✈️ *Flights* — [specific route/airline, price hint]
+→ Book on [Platform]: [link or "ask me for the link"]
+
+🏨 *Hotels* — [specific property, neighbourhood, price]
+→ Book on [Platform]: [link or "ask me for the link"]
+
+[repeat for up to 4 categories]
+
+_Book via these links and save a little too 💸_
+
+## Rules
+- ONLY use affiliate links from tool results — never fabricate URLs.
+- If no link: name the platform and say "reply 'link' and I'll grab it".
+- Never say "no results". Always give a real pick.
+- 180 words max. Every word earns its place.`;
 
 function getHistory(userId: number): ChatMessage[] {
   if (!sessions.has(userId)) {
@@ -55,62 +83,103 @@ export function clearHistory(userId: number) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1 — Intent extraction
+// Step 1 — Goal decomposition + SKU/product recommendations
 // ---------------------------------------------------------------------------
 
-const ShoppingIntentSchema = z.object({
-  /** Plain-English shopping query, e.g. "wireless headphones under $100" */
-  query: z.string(),
-  /** Optional merchant category: "electronics", "fashion", "travel", etc. */
+const CategorySchema = z.object({
+  /** Human label: "Flights", "Hotels", "Running Shoes", "Supplements" */
+  label: z.string(),
+  /**
+   * 2–3 specific recommendations for this category.
+   * For travel: hotel names, flight routes, activity names.
+   * For retail: product names, brands, model names.
+   * These are what the model knows — shown to the user before the buy link.
+   */
+  recommendations: z.array(z.string()).min(1).max(3),
+  /** Specific platform name to search in Laguna, e.g. "agoda", "trip.com", "klook", "nike" */
+  platform_search: z.string(),
+  /** Laguna category hint */
   category: z.string().optional(),
-  /** ISO 3166-1 alpha-2 country code the user is shopping from */
+});
+
+const GoalIntentSchema = z.object({
+  goal: z.string(),
+  categories: z.array(CategorySchema).min(1).max(6),
+  /** ISO 3166-1 alpha-2 if a country/region is mentioned */
   geo: z.string().length(2).optional(),
-  /** Maximum budget in USD if mentioned */
-  budget_usd: z.number().optional(),
-  /** Whether the user is asking for account/earnings info rather than shopping */
   is_dashboard_query: z.boolean().default(false),
-  /** true if the message has no shopping intent (greeting, off-topic, etc.) */
   is_off_topic: z.boolean().default(false),
 });
 
-type ShoppingIntent = z.infer<typeof ShoppingIntentSchema>;
+type GoalIntent = z.infer<typeof GoalIntentSchema>;
 
 async function extractIntent(
   history: ChatMessage[],
   userMessage: string
-): Promise<ShoppingIntent> {
-  // Strip system messages from history before splicing in — DeepSeek requires
-  // the system message to appear exactly once, at position 0.
+): Promise<GoalIntent> {
   const nonSystemHistory = history.filter((m) => m.role !== "system");
 
-  const extractionPrompt: ChatMessage[] = [
+  const prompt: ChatMessage[] = [
     {
       role: "system",
-      content: `You are an intent-extraction engine.
-Given the conversation and the latest user message, output ONLY valid JSON matching this schema:
+      content: `You are a goal-decomposition and recommendation engine for a travel and retail concierge.
+
+Given the user's message, output ONLY valid JSON:
 {
-  "query": string,           // what the user wants to buy/find
-  "category": string|null,   // merchant category if clear
-  "geo": string|null,        // 2-letter country code if mentioned
-  "budget_usd": number|null, // numeric budget if mentioned
-  "is_dashboard_query": bool,// true if user asks about earnings/balance/history
-  "is_off_topic": bool       // true if not a shopping request
+  "goal": string,
+  "categories": [
+    {
+      "label": string,              // e.g. "Flights", "Hotels", "Running Shoes", "Supplements"
+      "recommendations": [string],  // 2–3 SPECIFIC items: hotel names, product names, brands, routes
+      "platform_search": string,    // specific platform to search: "agoda", "trip.com", "klook", "nike", "iherb", "zalora", "asos"
+      "category": string            // one of: travel, fashion, electronics, health, retail
+    }
+  ],
+  "geo": string|null,
+  "is_dashboard_query": bool,
+  "is_off_topic": bool
 }
-Do not include any explanation — only the JSON object.`,
+
+## Recommendation rules
+Be SPECIFIC. Use real names the user will recognise:
+- Hotels: actual property names + neighbourhood + rough price, e.g. "The Layar Villa, Seminyak (~$150/night)"
+- Flights: route + airline, e.g. "AirAsia direct KUL→DPS (from ~$80)"
+- Activities: named tours, e.g. "Ubud Rice Terrace & Monkey Forest half-day (Klook, ~$25)"
+- Running shoes: model names, e.g. "Nike Pegasus 41", "Adidas Ultraboost 24"
+- Supplements: brand + product, e.g. "Optimum Nutrition Gold Standard Whey", "NOW Foods Vitamin C"
+- Fashion: brand + item, e.g. "Uniqlo AIRism T-shirt", "Levi's 511 slim jeans"
+
+## Platform search rules (platform_search field)
+Search specific platform names — NOT generic terms:
+- Flights: "airasia", "trip.com"
+- Hotels: "agoda", "booking.com", "trip.com"
+- Activities: "klook"
+- Fashion: "zalora", "asos", "nike", "adidas", "uniqlo"
+- Health/supplements: "iherb"
+- Electronics: "samsung", "lenovo", "dyson"
+- General: "lazada", "amazon"
+
+Max 6 categories. No explanation — only the JSON object.`,
     },
-    // Include last 6 turns of non-system history for context
     ...nonSystemHistory.slice(-6),
     { role: "user", content: userMessage },
   ];
 
-  const raw = await chat(extractionPrompt, true);
+  const raw = await chat(prompt, true);
 
   try {
-    return ShoppingIntentSchema.parse(JSON.parse(raw));
+    return GoalIntentSchema.parse(JSON.parse(raw));
   } catch {
-    // Fallback: treat whole message as query
     return {
-      query: userMessage,
+      goal: userMessage,
+      categories: [
+        {
+          label: "Deals",
+          recommendations: [userMessage],
+          platform_search: userMessage,
+          category: "retail",
+        },
+      ],
       is_dashboard_query: false,
       is_off_topic: false,
     };
@@ -118,49 +187,75 @@ Do not include any explanation — only the JSON object.`,
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 — Tool execution
+// Step 2 — Parallel merchant search + link minting
 // ---------------------------------------------------------------------------
 
-interface ToolResults {
-  merchants: Array<{
-    info: MerchantInfo;
-    link: MintedLink;
-  }>;
-  searchCount: number;
+export interface EnrichedCategory {
+  label: string;
+  recommendations: string[];
+  info: MerchantInfo;
+  link: MintedLink;
 }
 
-async function runTools(intent: ShoppingIntent, walletAddress: string): Promise<ToolResults> {
-  // 1. Search merchants
-  const found = await searchMerchants({
-    query: intent.query,
-    category: intent.category,
-    geo: intent.geo,
-    limit: 5,
-    sort: intent.query ? "relevance" : "cashback_rate",
-  });
-
-  // 2. Fetch detailed info + mint links for top 3 merchants in parallel
-  const top: Merchant[] = found.slice(0, 3);
-
-  const enriched = await Promise.allSettled(
-    top.map(async (m) => {
-      const [info, link] = await Promise.all([
-        getMerchantInfo({ merchant_id: m.id, geo: intent.geo }),
-        // Mint link credited to this specific user's wallet
-        mintLink({ merchant_id: m.id, geo: intent.geo, wallet_address: walletAddress }),
-      ]);
-      return { info, link };
+async function runTools(
+  intent: GoalIntent,
+  walletAddress: string
+): Promise<EnrichedCategory[]> {
+  // Search all platforms in parallel
+  const searchResults = await Promise.allSettled(
+    intent.categories.map(async (cat) => {
+      const found = await searchMerchants({
+        query: cat.platform_search,
+        category: cat.category,
+        geo: intent.geo,
+        limit: 2,
+        sort: "relevance",
+      });
+      return { cat, merchants: found };
     })
   );
 
-  const merchants = enriched
+  // Deduplicate by merchant id, keep best match per category
+  const seen = new Set<string>();
+  const candidates: Array<{
+    label: string;
+    recommendations: string[];
+    merchantId: string;
+    geo?: string;
+  }> = [];
+
+  for (const result of searchResults) {
+    if (result.status !== "fulfilled") continue;
+    const { cat, merchants } = result.value;
+    for (const m of merchants.slice(0, 1)) {
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      candidates.push({
+        label: cat.label,
+        recommendations: cat.recommendations,
+        merchantId: m.id,
+        geo: intent.geo,
+      });
+    }
+  }
+
+  // Fetch info + mint affiliate links in parallel
+  const enriched = await Promise.allSettled(
+    candidates.map(async ({ label, recommendations, merchantId, geo }) => {
+      const [info, link] = await Promise.all([
+        getMerchantInfo({ merchant_id: merchantId, geo }),
+        mintLink({ merchant_id: merchantId, geo, wallet_address: walletAddress }),
+      ]);
+      return { label, recommendations, info, link } satisfies EnrichedCategory;
+    })
+  );
+
+  return enriched
     .filter(
-      (r): r is PromiseFulfilledResult<{ info: MerchantInfo; link: MintedLink }> =>
+      (r): r is PromiseFulfilledResult<EnrichedCategory> =>
         r.status === "fulfilled"
     )
     .map((r) => r.value);
-
-  return { merchants, searchCount: found.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -170,36 +265,54 @@ async function runTools(intent: ShoppingIntent, walletAddress: string): Promise<
 async function composeResponse(
   history: ChatMessage[],
   userMessage: string,
-  intent: ShoppingIntent,
-  tools: ToolResults
+  intent: GoalIntent,
+  enriched: EnrichedCategory[]
 ): Promise<string> {
-  const toolSummary =
-    tools.merchants.length > 0
-      ? tools.merchants
-          .map((m, i) => {
-            const cashback =
-              m.info.cashback_rate ?? m.info.rates?.[0] ?? "varies";
-            return (
-              `${i + 1}. ${m.info.name} (${m.info.category ?? intent.category ?? "general"})` +
-              `\n   Cashback: ${cashback}` +
-              `\n   Link: ${m.link.shortlink}` +
-              (m.info.cookie_duration
-                ? `\n   Cookie: ${m.info.cookie_duration}`
-                : "") +
-              (m.info.payout_timeline
-                ? `\n   Payout: ${m.info.payout_timeline}`
-                : "")
-            );
-          })
-          .join("\n\n")
-      : "No merchants found for this query.";
+  // Build category blocks — matched (have a link) and unmatched (suggest platform)
+  const enrichedLabels = new Set(enriched.map((e) => e.label));
+
+  const matchedBlock = enriched
+    .map((e) => {
+      const cashback = e.info.cashback_rate ?? e.info.rates?.[0] ?? null;
+      return (
+        `[${e.label}]\n` +
+        `Recommendations: ${e.recommendations.join(" | ")}\n` +
+        `Platform: ${e.info.name}${cashback ? ` (${cashback} cashback)` : ""}\n` +
+        `Affiliate link: ${e.link.shortlink}`
+      );
+    })
+    .join("\n\n");
+
+  const unmatchedBlock = intent.categories
+    .filter((cat) => !enrichedLabels.has(cat.label))
+    .map(
+      (cat) =>
+        `[${cat.label}]\n` +
+        `Recommendations: ${cat.recommendations.join(" | ")}\n` +
+        `Platform to suggest: ${cat.platform_search} (no affiliate link yet — name the platform and offer to get a deal link)`
+    )
+    .join("\n\n");
 
   const compositionMessages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
     ...history.filter((m) => m.role !== "system").slice(-4),
     {
       role: "user",
-      content: `User asked: "${userMessage}"\n\nSearch returned ${tools.searchCount} merchants. Top picks with affiliate links:\n\n${toolSummary}\n\nWrite a friendly Telegram reply (Markdown OK). Highlight USDC cashback earnings. Keep it under 400 words.`,
+      content: `User's goal: "${userMessage}"
+${intent.geo ? `Region: ${intent.geo}` : ""}
+
+== CATEGORIES WITH AFFILIATE LINKS (use these links — do not fabricate) ==
+${matchedBlock || "None found."}
+
+== CATEGORIES WITHOUT LINKS YET ==
+${unmatchedBlock || "None."}
+
+Write a Telegram reply following the system prompt format EXACTLY.
+- 180 words MAX — cut ruthlessly.
+- Pick the top 3–4 categories only.
+- One specific pick per category, then the platform + link on the next line.
+- No fluff, no long intros, no "Great question!".
+- Cashback as a one-line PS at the very end.`,
     },
   ];
 
@@ -210,54 +323,36 @@ async function composeResponse(
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Process a user message end-to-end and return the bot reply.
- *
- * @param userId  Telegram user ID (used to key the session)
- * @param text    Raw user message text
- */
 export async function processMessage(
   userId: number,
   text: string,
   walletAddress: string
 ): Promise<string> {
   const history = getHistory(userId);
-
-  // Append user turn to history before processing
   history.push({ role: "user", content: text });
 
   try {
-    // Step 1 — extract structured intent
     const intent = await extractIntent(history, text);
 
     let reply: string;
 
     if (intent.is_off_topic) {
-      // Pass through to DeepSeek — ensure system message is always first
-      const offTopicMessages: ChatMessage[] = [
+      const messages: ChatMessage[] = [
         { role: "system", content: SYSTEM_PROMPT },
         ...history.filter((m) => m.role !== "system"),
       ];
-      reply = await chat(offTopicMessages);
+      reply = await chat(messages);
     } else if (intent.is_dashboard_query) {
-      // Handled separately in bot.ts via /dashboard command,
-      // but if user asks mid-conversation we can handle it here too
-      reply =
-        "Use /dashboard to see your current USDC balance and conversion history.";
+      reply = "Use /dashboard to check your savings and cashback history.";
     } else {
-      // Step 2 — call Laguna tools (links credited to this user's wallet)
-      const tools = await runTools(intent, walletAddress);
-
-      // Step 3 — compose reply
-      reply = await composeResponse(history, text, intent, tools);
+      const enriched = await runTools(intent, walletAddress);
+      reply = await composeResponse(history, text, intent, enriched);
     }
 
-    // Append assistant turn to history
     history.push({ role: "assistant", content: reply });
 
-    // Cap history at 20 turns (10 exchanges) to control context size
+    // Keep system prompt + last 20 turns
     if (history.length > 21) {
-      // Keep system prompt + last 20 turns
       history.splice(1, history.length - 21);
     }
 
@@ -265,7 +360,6 @@ export async function processMessage(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[agent] error processing message:", msg);
-    // Don't store error turns in history
     history.pop();
     throw err;
   }
