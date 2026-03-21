@@ -209,9 +209,18 @@ bot.command("dashboard", async (ctx: Context) => {
 
 const MAX_TG_LENGTH = 4096;
 
+async function sendChunk(ctx: Context, text: string) {
+  try {
+    await ctx.reply(text, { parse_mode: "Markdown" });
+  } catch {
+    // Markdown parse failed — strip formatting and send as plain text
+    await ctx.reply(text.replace(/[*_`[\]]/g, ""));
+  }
+}
+
 async function sendLongMessage(ctx: Context, text: string) {
   if (text.length <= MAX_TG_LENGTH) {
-    await ctx.reply(text, { parse_mode: "Markdown" });
+    await sendChunk(ctx, text);
     return;
   }
   // Split on paragraph breaks where possible
@@ -226,7 +235,7 @@ async function sendLongMessage(ctx: Context, text: string) {
   }
   if (remaining) chunks.push(remaining);
   for (const chunk of chunks) {
-    await ctx.reply(chunk, { parse_mode: "Markdown" });
+    await sendChunk(ctx, chunk);
   }
 }
 
