@@ -16,6 +16,7 @@
  */
 
 import "dotenv/config";
+import { createServer } from "http";
 import { readFileSync, writeFileSync } from "fs";
 import { Bot, GrammyError, HttpError, type Context } from "grammy";
 import { processMessage, clearHistory } from "./agent.js";
@@ -255,6 +256,20 @@ bot.catch((err) => {
 
 // ---------------------------------------------------------------------------
 // Start
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Health check server — required for Render free Web Service tier
+// ---------------------------------------------------------------------------
+
+const PORT = Number(process.env.PORT) || 3000;
+createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+}).listen(PORT, () => console.log(`[bot] Health check listening on port ${PORT}`));
+
+// ---------------------------------------------------------------------------
+// Start bot
 // ---------------------------------------------------------------------------
 
 console.log("[bot] Starting Nexus Gateway…");
