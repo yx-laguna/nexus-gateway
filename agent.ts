@@ -79,6 +79,10 @@ async function extractIntent(
   history: ChatMessage[],
   userMessage: string
 ): Promise<ShoppingIntent> {
+  // Strip system messages from history before splicing in — DeepSeek requires
+  // the system message to appear exactly once, at position 0.
+  const nonSystemHistory = history.filter((m) => m.role !== "system");
+
   const extractionPrompt: ChatMessage[] = [
     {
       role: "system",
@@ -94,8 +98,8 @@ Given the conversation and the latest user message, output ONLY valid JSON match
 }
 Do not include any explanation — only the JSON object.`,
     },
-    // Include last 6 turns of history for context
-    ...history.slice(-6),
+    // Include last 6 turns of non-system history for context
+    ...nonSystemHistory.slice(-6),
     { role: "user", content: userMessage },
   ];
 
@@ -192,7 +196,7 @@ async function composeResponse(
 
   const compositionMessages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
-    ...history.slice(-4),
+    ...history.filter((m) => m.role !== "system").slice(-4),
     {
       role: "user",
       content: `User asked: "${userMessage}"\n\nSearch returned ${tools.searchCount} merchants. Top picks with affiliate links:\n\n${toolSummary}\n\nWrite a friendly Telegram reply (Markdown OK). Highlight USDC cashback earnings. Keep it under 400 words.`,
@@ -229,8 +233,12 @@ export async function processMessage(
     let reply: string;
 
     if (intent.is_off_topic) {
-      // Pass through to DeepSeek for a general response
-      reply = await chat(history);
+      // Pass through to DeepSeek — ensure system message is always first
+      const offTopicMessages: ChatMessage[] = [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history.filter((m) => m.role !== "system"),
+      ];
+      reply = await chat(offTopicMessages);
     } else if (intent.is_dashboard_query) {
       // Handled separately in bot.ts via /dashboard command,
       // but if user asks mid-conversation we can handle it here too
