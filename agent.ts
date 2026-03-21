@@ -102,10 +102,8 @@ const CategorySchema = z.object({
    * These are what the model knows — shown to the user before the buy link.
    */
   recommendations: z.array(z.string()).min(1).max(3),
-  /** Specific platform name to search in Laguna, e.g. "agoda", "trip.com", "klook", "nike" */
+  /** Specific platform name to search in Laguna — must match verified slugs */
   platform_search: z.string(),
-  /** Laguna category hint */
-  category: z.string().optional(),
 });
 
 const GoalIntentSchema = z.object({
@@ -151,8 +149,7 @@ If multiple intents, choose the most explicit one. If unclear, treat as "general
     {
       "label": string,              // e.g. "Flights", "Hotels", "Running Shoes", "Supplements"
       "recommendations": [string],  // 2–3 SPECIFIC items with real names + price hints
-      "platform_search": string,    // exact platform slug to search: "agoda", "trip.com", "klook", "nike", "iherb", "zalora", "asos", "booking.com", "airasia"
-      "category": string            // one of: travel, fashion, electronics, health, retail
+      "platform_search": string     // exact platform slug from the verified list below
     }
   ],
   "geo": string|null,               // ISO 3166-1 alpha-2 if a country/region is mentioned
@@ -170,14 +167,18 @@ If multiple intents, choose the most explicit one. If unclear, treat as "general
 - Supplements: brand + product, e.g. "Optimum Nutrition Gold Standard Whey"
 - Fashion: brand + item, e.g. "Uniqlo AIRism T-shirt", "Levi's 511 slim jeans"
 
-## Platform search slugs:
-- Flights → "airasia", "trip.com"
-- Hotels → "agoda", "trip.com", "booking.com"
-- Activities → "klook"
-- Fashion → "zalora", "asos", "nike", "adidas", "uniqlo"
-- Health → "iherb"
-- Electronics → "samsung", "lenovo", "dyson"
-- General → "lazada", "amazon"
+## Platform search slugs (use EXACTLY these — they are verified in our affiliate system):
+// NOTE: This is the DEV environment of Laguna MCP (https://agents-dev.laguna.network/mcp).
+// Merchant list is limited and categories are not fully tagged yet.
+// When switched to production MCP URL, the full merchant catalogue + proper category slugs
+// will be available — update platform slugs and re-enable category filtering at that point.
+- Flights → "airasia travel" or "trip.com"
+- Hotels → "agoda" or "trip.com" or "hotels.com"
+- Activities/Tours → "klook" or "kkday"
+- Fashion/Apparel → "shein" or "asos" or "farfetch" or "cotton on"
+- Health/Supplements → "iherb"
+- Gifts/General → "temu"
+- Luxury Hotels → "hyatt" or "ihg" or "dusit"
 
 Max 4 categories. Output JSON only.`,
     },
@@ -223,7 +224,7 @@ async function runTools(
     intent.categories.map(async (cat) => {
       const found = await searchMerchants({
         query: cat.platform_search,
-        category: cat.category,
+        // category filter omitted — Laguna does not use category slugs
         geo: intent.geo,
         limit: 2,
         sort: "relevance",
@@ -310,20 +311,21 @@ async function composeResponse(
   // Build fallback URLs for platforms without affiliate links
   const platformUrls: Record<string, string> = {
     "agoda": "https://agoda.com",
-    "booking.com": "https://booking.com",
-    "trip.com": "https://trip.com",
+    "trip": "https://trip.com",
     "airasia": "https://airasia.com",
-    "skyscanner": "https://skyscanner.com",
     "klook": "https://klook.com",
-    "zalora": "https://zalora.com",
+    "kkday": "https://kkday.com",
+    "hotels": "https://hotels.com",
+    "hyatt": "https://hyatt.com",
+    "ihg": "https://ihg.com",
+    "dusit": "https://dusithotels.com",
+    "expedia": "https://expedia.com",
+    "shein": "https://shein.com",
     "asos": "https://asos.com",
-    "nike": "https://nike.com",
-    "adidas": "https://adidas.com",
+    "farfetch": "https://farfetch.com",
+    "cotton": "https://cottonon.com",
     "iherb": "https://iherb.com",
-    "lazada": "https://lazada.com",
-    "amazon": "https://amazon.com",
-    "uniqlo": "https://uniqlo.com",
-    "sephora": "https://sephora.com",
+    "temu": "https://temu.com",
   };
 
   const unmatchedBlock = intent.categories
