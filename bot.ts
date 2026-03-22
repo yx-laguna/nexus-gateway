@@ -372,7 +372,13 @@ bot.on("message:text", async (ctx: Context) => {
   }
 
   // ── Fully onboarded — pass to agent ─────────────────────────────────────
-  await ctx.reply("⏳ On it — give me ~30 seconds while I find the best options for you!");
+  // Only show the waiting message for shopping/travel queries that hit the
+  // full LLM + Laguna pipeline. Short casual messages respond in <2s.
+  const SHOPPING_KEYWORDS = /hotel|flight|book|buy|shop|trip|travel|plan|stay|find|search|recommend|cheapest|best|vitamin|supplement|shoe|shirt|bag|watch|phone|laptop|ticket|tour|activity|nike|klook|shein|temu|crocs|puma|iherb|fashion|apparel|deal|price|cheap|affordable/i;
+  const isSlowQuery = text.trim().split(/\s+/).length > 3 || SHOPPING_KEYWORDS.test(text);
+  if (isSlowQuery) {
+    await ctx.reply("⏳ On it — give me ~30 seconds while I find the best options for you!");
+  }
   await ctx.replyWithChatAction("typing");
   try {
     const reply = await processMessage(userId, text, profile.wallet ?? "", profile.country);
