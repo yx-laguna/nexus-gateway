@@ -204,16 +204,57 @@ async function runTools(
   intent: GoalIntent,
   walletAddress: string
 ): Promise<EnrichedCategory[]> {
-  // Search all platforms in parallel
+  // Category → generic fallback query when specific platform returns 0
+  const CATEGORY_FALLBACKS: Record<string, string[]> = {
+    flights:      ["airasia", "trip.com", "travel"],
+    flight:       ["airasia", "trip.com", "travel"],
+    hotels:       ["agoda", "trip.com", "booking"],
+    hotel:        ["agoda", "trip.com", "booking"],
+    activities:   ["klook", "kkday", "experience"],
+    activity:     ["klook", "kkday", "experience"],
+    tours:        ["klook", "kkday"],
+    fashion:      ["shein", "asos", "zalora", "fashion"],
+    apparel:      ["shein", "asos", "zalora"],
+    shopping:     ["shein", "temu", "zalora"],
+    supplements:  ["iherb", "health"],
+    health:       ["iherb", "health"],
+    electronics:  ["lazada", "shopee"],
+    sports:       ["nike", "adidas", "decathlon"],
+  };
+
+  function fallbackQueries(label: string): string[] {
+    const key = label.toLowerCase();
+    return (
+      Object.entries(CATEGORY_FALLBACKS).find(([k]) => key.includes(k))?.[1] ?? ["deals"]
+    );
+  }
+
+  // Search all platforms in parallel — with category fallback if 0 results
   const searchResults = await Promise.allSettled(
     intent.categories.map(async (cat) => {
-      const found = await searchMerchants({
+      // Primary search — specific platform
+      let found = await searchMerchants({
         query: cat.platform_search,
-        // category filter omitted — Laguna does not use category slugs
         geo: intent.geo,
-        limit: 2,
+        limit: 3,
         sort: "relevance",
       });
+
+      // Fallback: try alternative queries for the same category
+      if (found.length === 0) {
+        console.log(`[agent] 0 results for "${cat.platform_search}" — trying category fallback`);
+        const fallbacks = fallbackQueries(cat.label).filter(
+          (q) => q.toLowerCase() !== cat.platform_search.toLowerCase()
+        );
+        for (const query of fallbacks) {
+          found = await searchMerchants({ query, geo: intent.geo, limit: 3, sort: "cashback_rate" });
+          if (found.length > 0) {
+            console.log(`[agent] fallback "${query}" → ${found.length} result(s):`, found.map((m) => m.id));
+            break;
+          }
+        }
+      }
+
       return { cat, merchants: found };
     })
   );
@@ -253,44 +294,39 @@ async function runTools(
         getMerchantInfo({ merchant_id: merchantId, geo }),
         mintLink({ merchant_id: merchantId, geo, wallet_address: walletAddress }),
       ]);
-      console.log(`[agent] minted link for ${merchantId}:`, link.shortlink);
+      console.log(`[agent] ✅ minted link for ${merchantId}:`, link.shortlink);
       return { label, recommendations, info, link } satisfies EnrichedCategory;
     })
   );
 
-  return enriched
+  const results = enriched
     .filter((r): r is PromiseFulfilledResult<EnrichedCategory> => {
       if (r.status !== "fulfilled") {
-        console.error("[agent] mint/info failed:", (r as PromiseRejectedResult).reason);
+        console.error("[agent] ❌ mint/info failed:", (r as PromiseRejectedResult).reason);
       }
       return r.status === "fulfilled";
     })
     .map((r) => r.value);
+
+  // POST-PROCESSING VALIDATION (DeepSeek suggestion 3 — Node.js layer)
+  // If Laguna returned 0 minted links, log clearly so we can diagnose
+  if (results.length === 0 && candidates.length > 0) {
+    console.warn(`[agent] ⚠️ validation: ${candidates.length} candidate(s) found but 0 links minted — Laguna mint failed for all`);
+  } else if (candidates.length === 0) {
+    console.warn(`[agent] ⚠️ validation: 0 merchants found by search — check slugs or Laguna merchant list`);
+  } else {
+    console.log(`[agent] ✅ validation: ${results.length}/${candidates.length} links minted successfully`);
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
 // Step 3 — Pure Node.js response formatter (no LLM — no hallucinated URLs)
 // ---------------------------------------------------------------------------
 
-const FALLBACK_URLS: Record<string, string> = {
-  agoda:    "https://agoda.com",
-  trip:     "https://trip.com",
-  airasia:  "https://airasia.com",
-  klook:    "https://klook.com",
-  kkday:    "https://kkday.com",
-  hotels:   "https://hotels.com",
-  hyatt:    "https://hyatt.com",
-  ihg:      "https://ihg.com",
-  dusit:    "https://dusithotels.com",
-  shein:    "https://shein.com",
-  asos:     "https://asos.com",
-  farfetch: "https://farfetch.com",
-  cotton:   "https://cottonon.com",
-  iherb:    "https://iherb.com",
-  temu:     "https://temu.com",
-  nike:     "https://nike.com",
-  adidas:   "https://adidas.com",
-};
+// No fallback URLs — every link MUST be minted via Laguna MCP.
+// If Laguna doesn't have the merchant, we show the platform name only (no URL).
 
 const CATEGORY_EMOJI: Record<string, string> = {
   flights:      "✈️",
@@ -317,14 +353,6 @@ function emojiFor(label: string): string {
     ?? CATEGORY_EMOJI.default;
 }
 
-function fallbackUrl(platformSearch: string): string {
-  const key = platformSearch.toLowerCase();
-  return (
-    Object.entries(FALLBACK_URLS).find(([k]) => key.includes(k))?.[1]
-    ?? `https://${key.replace(/[^a-z0-9]/g, "")}.com`
-  );
-}
-
 function buildReply(
   intent: GoalIntent,
   enriched: EnrichedCategory[],
@@ -346,11 +374,12 @@ function buildReply(
     lines.push(`${emoji} *${cat.label}* — ${pick}`);
 
     if (matched?.link?.shortlink) {
+      // Laguna-minted affiliate link — the only kind we show
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
     } else {
-      const url = fallbackUrl(cat.platform_search);
-      lines.push(`→ Book on ${cat.platform_search}: ${url}`);
+      // No Laguna merchant found — show platform name only, no URL
+      lines.push(`→ via ${cat.platform_search} _(affiliate link not available yet)_`);
     }
 
     lines.push(""); // blank line between categories
