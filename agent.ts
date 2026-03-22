@@ -44,8 +44,9 @@ const SYSTEM_PROMPT = `You are Opi, a friendly travel and shopping concierge on 
 - Chat naturally. Help the user figure out what they want.
 - ONE question at a time. Never interrogate.
 - Travel: you need destination + rough dates before acting.
-- Shopping: you need the item/category + rough budget or preference.
-- If something critical is missing, ask for the ONE most important thing.
+- Shopping: you need the item/category. Budget is nice but optional — if they give a budget, USE it, do NOT ask again.
+- If the user already told you the item, budget, or destination — act immediately. Do NOT re-ask for info already given.
+- Only ask a clarifying question if you genuinely cannot search at all without it.
 
 ## What you NEVER do in conversation
 - NEVER produce URLs, links, or platform names with addresses.
@@ -91,8 +92,9 @@ const CategorySchema = z.object({
    * These are what the model knows — shown to the user before the buy link.
    */
   recommendations: z.array(z.string()).min(1).max(3),
-  /** Specific platform name to search in Laguna — must match verified slugs */
-  platform_search: z.string(),
+  /** Specific platform name to search in Laguna — must match verified slugs.
+   *  Optional — if LLM omits it we derive from label in platformsForCategory(). */
+  platform_search: z.string().optional().default(""),
 });
 
 const GoalIntentSchema = z.object({
@@ -142,8 +144,8 @@ If multiple intents, choose the most explicit one. If unclear, treat as "general
     }
   ],
   "geo": string|null,               // ISO 3166-1 alpha-2 if a country/region is mentioned
-  "needs_clarification": bool,      // true if critical info is missing (destination, dates, budget)
-  "clarification_question": string, // ONE question to ask if needs_clarification is true
+  "needs_clarification": bool,      // true ONLY if you genuinely cannot produce categories without more info. If the user already stated product type, budget, or destination — set false and search immediately. NEVER ask for info the user already gave.
+  "clarification_question": string, // ONE short question only if needs_clarification is true
   "is_dashboard_query": bool,
   "is_off_topic": bool
 }
@@ -177,9 +179,11 @@ Max 4 categories. Output JSON only.`,
 
   try {
     return GoalIntentSchema.parse(JSON.parse(raw));
-  } catch {
-    // Safe fallback — treat as a general question, never fabricate a search
-    console.warn("[agent] intent parse failed, falling back to general_question. Raw:", raw.slice(0, 200));
+  } catch (err) {
+    // Log the full Zod error so we can see exactly which field failed
+    console.warn("[agent] intent parse failed, falling back to general_question.");
+    console.warn("[agent] Zod error:", err instanceof Error ? err.message : String(err));
+    console.warn("[agent] Raw JSON:", raw.slice(0, 500));
     return {
       goal: userMessage,
       intent: "general_question",
@@ -507,8 +511,10 @@ export async function processMessage(
   history.push({ role: "user", content: text });
 
   try {
-    // Skip intent extraction for short casual messages — saves an LLM call
-    const isCasual = text.trim().split(/\s+/).length <= 4 && !/hotel|flight|book|buy|shop|trip|travel|order|plan|stay|rent/i.test(text);
+    // Skip intent extraction for short casual greetings only.
+    // Any message referencing shopping/products/travel → always extractIntent.
+    const SHOPPING_KEYWORDS = /hotel|flight|book|buy|shop|trip|travel|order|plan|stay|rent|find|search|recommend|get me|cheapest|best|vitamin|supplement|pill|skincare|shoe|shirt|bag|watch|phone|laptop|ticket|tour|activity|iherb|nike|klook|shein|temu|crocs|puma/i;
+    const isCasual = text.trim().split(/\s+/).length <= 3 && !SHOPPING_KEYWORDS.test(text);
 
     let reply: string;
 
