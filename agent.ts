@@ -286,90 +286,118 @@ async function runTools(
 }
 
 // ---------------------------------------------------------------------------
-// Step 3 — Response composition
+// Step 3 — Pure Node.js response formatter (no LLM — no hallucinated URLs)
 // ---------------------------------------------------------------------------
 
-async function composeResponse(
-  history: ChatMessage[],
-  userMessage: string,
+const FALLBACK_URLS: Record<string, string> = {
+  agoda:    "https://agoda.com",
+  trip:     "https://trip.com",
+  airasia:  "https://airasia.com",
+  klook:    "https://klook.com",
+  kkday:    "https://kkday.com",
+  hotels:   "https://hotels.com",
+  hyatt:    "https://hyatt.com",
+  ihg:      "https://ihg.com",
+  dusit:    "https://dusithotels.com",
+  shein:    "https://shein.com",
+  asos:     "https://asos.com",
+  farfetch: "https://farfetch.com",
+  cotton:   "https://cottonon.com",
+  iherb:    "https://iherb.com",
+  temu:     "https://temu.com",
+  nike:     "https://nike.com",
+  adidas:   "https://adidas.com",
+};
+
+const CATEGORY_EMOJI: Record<string, string> = {
+  flights:      "✈️",
+  flight:       "✈️",
+  hotels:       "🏨",
+  hotel:        "🏨",
+  activities:   "🎯",
+  activity:     "🎯",
+  tours:        "🗺️",
+  transport:    "🚗",
+  fashion:      "👗",
+  apparel:      "👗",
+  shopping:     "🛍️",
+  supplements:  "💊",
+  health:       "💊",
+  electronics:  "💻",
+  sports:       "👟",
+  default:      "📌",
+};
+
+function emojiFor(label: string): string {
+  const key = label.toLowerCase();
+  return Object.entries(CATEGORY_EMOJI).find(([k]) => key.includes(k))?.[1]
+    ?? CATEGORY_EMOJI.default;
+}
+
+function fallbackUrl(platformSearch: string): string {
+  const key = platformSearch.toLowerCase();
+  return (
+    Object.entries(FALLBACK_URLS).find(([k]) => key.includes(k))?.[1]
+    ?? `https://${key.replace(/[^a-z0-9]/g, "")}.com`
+  );
+}
+
+function buildReply(
   intent: GoalIntent,
-  enriched: EnrichedCategory[]
-): Promise<string> {
-  // Build category blocks — matched (have a link) and unmatched (suggest platform)
-  const enrichedLabels = new Set(enriched.map((e) => e.label));
+  enriched: EnrichedCategory[],
+  hasWallet: boolean,
+  userCountry?: string
+): string {
+  const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
+  const lines: string[] = [];
 
-  const matchedBlock = enriched
-    .map((e) => {
-      const cashback = e.info.cashback_rate ?? e.info.rates?.[0] ?? null;
-      return (
-        `[${e.label}]\n` +
-        `Recommendations: ${e.recommendations.join(" | ")}\n` +
-        `Platform: ${e.info.name}${cashback ? ` (${cashback} cashback)` : ""}\n` +
-        `Affiliate link: ${e.link.shortlink}`
-      );
-    })
-    .join("\n\n");
+  // Opening confirm line
+  lines.push(`On it — here's your plan for *${intent.goal}*.\n`);
 
-  // Build fallback URLs for platforms without affiliate links
-  const platformUrls: Record<string, string> = {
-    "agoda": "https://agoda.com",
-    "trip": "https://trip.com",
-    "airasia": "https://airasia.com",
-    "klook": "https://klook.com",
-    "kkday": "https://kkday.com",
-    "hotels": "https://hotels.com",
-    "hyatt": "https://hyatt.com",
-    "ihg": "https://ihg.com",
-    "dusit": "https://dusithotels.com",
-    "expedia": "https://expedia.com",
-    "shein": "https://shein.com",
-    "asos": "https://asos.com",
-    "farfetch": "https://farfetch.com",
-    "cotton": "https://cottonon.com",
-    "iherb": "https://iherb.com",
-    "temu": "https://temu.com",
-  };
+  // One block per category
+  for (const cat of intent.categories.slice(0, 4)) {
+    const emoji = emojiFor(cat.label);
+    const pick = cat.recommendations[0] ?? cat.label;
+    const matched = enrichedByLabel.get(cat.label);
 
-  const unmatchedBlock = intent.categories
-    .filter((cat) => !enrichedLabels.has(cat.label))
-    .map((cat) => {
-      const key = cat.platform_search.toLowerCase();
-      const fallbackUrl = Object.entries(platformUrls).find(([k]) =>
-        key.includes(k)
-      )?.[1] ?? `https://${key.replace(/\s+/g, "")}.com`;
-      return (
-        `[${cat.label}]\n` +
-        `Recommendations: ${cat.recommendations.join(" | ")}\n` +
-        `Platform: ${cat.platform_search} — use this URL directly: ${fallbackUrl}`
-      );
-    })
-    .join("\n\n");
+    lines.push(`${emoji} *${cat.label}* — ${pick}`);
 
-  const compositionMessages: ChatMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...history.filter((m) => m.role !== "system").slice(-4),
-    {
-      role: "user",
-      content: `User's goal: "${userMessage}"
-${intent.geo ? `Region: ${intent.geo}` : ""}
+    if (matched?.link?.shortlink) {
+      const name = matched.info?.name ?? cat.platform_search;
+      lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
+    } else {
+      const url = fallbackUrl(cat.platform_search);
+      lines.push(`→ Book on ${cat.platform_search}: ${url}`);
+    }
 
-== CATEGORIES WITH AFFILIATE LINKS (use these links — do not fabricate) ==
-${matchedBlock || "None found."}
+    lines.push(""); // blank line between categories
+  }
 
-== CATEGORIES WITHOUT LINKS YET ==
-${unmatchedBlock || "None."}
+  lines.push("_Book through these links and save a little too 💸_");
 
-Write the Telegram reply now. Follow the system prompt format EXACTLY.
-- 150 words MAX.
-- Top 3–4 categories only.
-- One specific pick per category + the URL on the next line.
-- Use affiliate links where provided. Use the fallback URL where not. Never ask the user for anything.
-- Output the reply only. No reasoning steps, no preamble, no meta-commentary.
-- Cashback as one PS line at the very end.`,
-    },
-  ];
+  // PS cashback — only if we have a confirmed rate from tool results
+  const cashbackItems = enriched
+    .filter((e) => e.info?.cashback_rate)
+    .map((e) => `${e.info.name} (${e.info.cashback_rate} cashback)`)
+    .slice(0, 2);
 
-  return chat(compositionMessages);
+  if (cashbackItems.length > 0) {
+    lines.push(`PS: Earn USDC cashback via ${cashbackItems.join(", ")}.`);
+  }
+
+  // Country reminder — shown when geo was used so user knows to update if needed
+  if (userCountry) {
+    lines.push(`\n_Links are curated for *${userCountry}*. Shopping from somewhere else? Just let me know or update with \`/setcountry\`._`);
+  }
+
+  // Wallet nudge — only shown when no wallet is set yet
+  if (!hasWallet) {
+    lines.push(
+      `\n💳 *Want to earn cashback on these?*\nSave your EVM wallet and I'll track your USDC commissions:\n\`/setwallet 0xYourAddress\``
+    );
+  }
+
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +407,8 @@ Write the Telegram reply now. Follow the system prompt format EXACTLY.
 export async function processMessage(
   userId: number,
   text: string,
-  walletAddress: string
+  walletAddress: string,   // empty string means no wallet set yet
+  userCountry?: string     // ISO alpha-2, e.g. "SG" — from user profile
 ): Promise<string> {
   const history = getHistory(userId);
   history.push({ role: "user", content: text });
@@ -431,8 +460,10 @@ export async function processMessage(
     } else {
       // Intent is clear and complete — call Laguna, mint links, present plan
       console.log(`[agent] intent confirmed: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")}`);
+      // Use profile country as geo if intent didn't detect one from the message
+      if (!intent.geo && userCountry) intent.geo = userCountry;
       const enriched = await runTools(intent, walletAddress);
-      reply = await composeResponse(history, text, intent, enriched);
+      reply = buildReply(intent, enriched, !!walletAddress, userCountry);
     }
 
     // Cap stored reply to prevent context ballooning over long sessions

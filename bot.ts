@@ -33,37 +33,62 @@ if (!token) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-user wallet store — persisted to wallets.json
+// Per-user profile store — wallet + country, persisted to profiles.json
 // ---------------------------------------------------------------------------
 
-const WALLETS_FILE = "./wallets.json";
+interface UserProfile {
+  wallet?: string;
+  country?: string; // ISO 3166-1 alpha-2, e.g. "SG", "US"
+}
 
-function loadWallets(): Map<number, string> {
+const PROFILES_FILE = "./profiles.json";
+
+function loadProfiles(): Map<number, UserProfile> {
   try {
-    const raw = readFileSync(WALLETS_FILE, "utf8");
-    return new Map(Object.entries(JSON.parse(raw)).map(([k, v]) => [Number(k), v as string]));
+    const raw = readFileSync(PROFILES_FILE, "utf8");
+    return new Map(
+      Object.entries(JSON.parse(raw)).map(([k, v]) => [Number(k), v as UserProfile])
+    );
   } catch {
     return new Map();
   }
 }
 
-function saveWallets(map: Map<number, string>) {
-  writeFileSync(WALLETS_FILE, JSON.stringify(Object.fromEntries(map)), "utf8");
+function saveProfiles(map: Map<number, UserProfile>) {
+  writeFileSync(PROFILES_FILE, JSON.stringify(Object.fromEntries(map)), "utf8");
 }
 
-const wallets = loadWallets();
-console.log(`[bot] Loaded ${wallets.size} saved wallet(s)`);
+const profiles = loadProfiles();
+console.log(`[bot] Loaded ${profiles.size} saved profile(s)`);
 
-function getWallet(userId: number): string | undefined {
-  return wallets.get(userId);
+function getProfile(userId: number): UserProfile {
+  return profiles.get(userId) ?? {};
 }
 
-function setWallet(userId: number, address: string) {
-  wallets.set(userId, address);
-  saveWallets(wallets);
+function updateProfile(userId: number, update: Partial<UserProfile>) {
+  const existing = getProfile(userId);
+  profiles.set(userId, { ...existing, ...update });
+  saveProfiles(profiles);
 }
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+// Converts country name or code to ISO alpha-2
+const COUNTRY_MAP: Record<string, string> = {
+  "singapore": "SG", "malaysia": "MY", "indonesia": "ID", "thailand": "TH",
+  "philippines": "PH", "vietnam": "VN", "australia": "AU", "japan": "JP",
+  "korea": "KR", "china": "CN", "india": "IN", "uk": "GB",
+  "united kingdom": "GB", "united states": "US", "usa": "US", "us": "US",
+  "uae": "AE", "dubai": "AE", "germany": "DE", "france": "FR",
+  "canada": "CA", "hong kong": "HK", "taiwan": "TW",
+};
+
+function parseCountry(input: string): string | null {
+  const clean = input.trim().toLowerCase();
+  // Already a 2-letter code
+  if (/^[a-z]{2}$/.test(clean)) return clean.toUpperCase();
+  return COUNTRY_MAP[clean] ?? null;
+}
 
 // ---------------------------------------------------------------------------
 // Bot setup
@@ -76,20 +101,24 @@ const bot = new Bot(token);
 // ---------------------------------------------------------------------------
 
 bot.command("start", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const profile = getProfile(userId);
+
   await ctx.reply(
-    `👋 *Welcome to Nexus — your AI shopping agent!*\n\n` +
-      `I find the best deals and generate *affiliate links* for retail & travel. ` +
-      `Every time someone books or buys through your link, you earn *USDC* directly to your wallet.\n\n` +
-      `*To get started, set your wallet address:*\n` +
-      `/setwallet 0xYourEVMAddressHere\n\n` +
-      `Then just tell me what you're looking for, e.g.:\n` +
-      `• "Best flights to Tokyo in April"\n` +
-      `• "Wireless headphones under $80"\n` +
-      `• "Cashback on Nike or Adidas"\n\n` +
-      `Other commands:\n` +
-      `/mywallet — show your saved wallet\n` +
-      `/dashboard — check your USDC earnings\n` +
-      `/new — clear conversation and start fresh`,
+    `👋 *Hey! I'm Opi — your personal travel & shopping concierge.*\n\n` +
+    `I find the best deals across flights, hotels, and retail — and earn you *USDC cashback* on everything you book or buy.\n\n` +
+    `To get started I just need two things:\n\n` +
+    `🌍 *Where are you shopping from?*\n` +
+    `Reply with your country — e.g. _Singapore_, _Malaysia_, _United States_\n` +
+    `(This helps me show you merchants available in your region)\n\n` +
+    `💳 *Your EVM wallet address* to receive cashback:\n` +
+    `\`/setwallet 0xYourAddress\`\n\n` +
+    (profile.country || profile.wallet
+      ? `_Your current profile:_\n` +
+        (profile.country ? `🌍 Country: *${profile.country}*\n` : `🌍 Country: not set\n`) +
+        (profile.wallet ? `💳 Wallet: \`${profile.wallet}\`` : `💳 Wallet: not set`)
+      : `_Once both are set, just tell me what you're looking for!_`),
     { parse_mode: "Markdown" }
   );
 });
@@ -107,18 +136,58 @@ bot.command("setwallet", async (ctx: Context) => {
 
   if (!address || !EVM_ADDRESS_RE.test(address)) {
     await ctx.reply(
-      `⚠️ Please provide a valid EVM wallet address.\n\n` +
-        `Example:\n\`/setwallet 0xAbCd...1234\``,
+      `⚠️ Please provide a valid EVM wallet address.\n\nExample:\n\`/setwallet 0xAbCd...1234\``,
       { parse_mode: "Markdown" }
     );
     return;
   }
 
-  setWallet(userId, address);
+  updateProfile(userId, { wallet: address });
+  const profile = getProfile(userId);
   await ctx.reply(
-    `✅ Wallet saved!\n\n\`${address}\`\n\n` +
-      `Affiliate links I generate will credit USDC to this address. ` +
-      `Now tell me what you want to shop for!`,
+    `✅ *Wallet saved!*\n\`${address}\`\n\n` +
+    (profile.country
+      ? `You're all set! Tell me what you're looking for and I'll find you the best deals + cashback. 🛍️`
+      : `One more thing — what country are you shopping from?\nReply with e.g. _Singapore_, _Malaysia_, _United States_`),
+    { parse_mode: "Markdown" }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// /setcountry
+// ---------------------------------------------------------------------------
+
+bot.command("setcountry", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const parts = ctx.message?.text?.trim().split(/\s+/);
+  const input = parts?.slice(1).join(" ");
+
+  if (!input) {
+    await ctx.reply(
+      `Please tell me your country. Example:\n\`/setcountry Singapore\``,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  const code = parseCountry(input);
+  if (!code) {
+    await ctx.reply(
+      `⚠️ Couldn't recognise that country. Try using the full name or 2-letter code, e.g.:\n\`/setcountry SG\` or \`/setcountry Singapore\``,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  updateProfile(userId, { country: code });
+  const profile = getProfile(userId);
+  await ctx.reply(
+    `✅ *Country set to ${code}!*\n\n` +
+    (profile.wallet
+      ? `You're all set! Tell me what you're looking for and I'll find you the best deals. 🛍️`
+      : `Now add your wallet to earn cashback:\n\`/setwallet 0xYourAddress\``),
     { parse_mode: "Markdown" }
   );
 });
@@ -131,15 +200,13 @@ bot.command("mywallet", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const wallet = getWallet(userId);
-  if (!wallet) {
-    await ctx.reply(
-      `No wallet set yet. Use:\n\`/setwallet 0xYourAddress\``,
-      { parse_mode: "Markdown" }
-    );
-  } else {
-    await ctx.reply(`Your wallet: \`${wallet}\``, { parse_mode: "Markdown" });
-  }
+  const profile = getProfile(userId);
+  await ctx.reply(
+    `*Your Opi Profile*\n\n` +
+    `🌍 Country: ${profile.country ? `*${profile.country}*` : `not set — \`/setcountry Singapore\``}\n` +
+    `💳 Wallet: ${profile.wallet ? `\`${profile.wallet}\`` : `not set — \`/setwallet 0xYourAddress\``}`,
+    { parse_mode: "Markdown" }
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -160,7 +227,7 @@ bot.command("dashboard", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const wallet = getWallet(userId);
+  const { wallet } = getProfile(userId);
   if (!wallet) {
     await ctx.reply(
       `Set your wallet first so I can look up your earnings:\n\`/setwallet 0xYourAddress\``,
@@ -248,21 +315,28 @@ bot.on("message:text", async (ctx: Context) => {
   const text = ctx.message?.text;
   if (!userId || !text) return;
 
-  // Prompt wallet setup if not set yet
-  const wallet = getWallet(userId);
-  if (!wallet) {
-    await ctx.reply(
-      `Before I can generate affiliate links for you, I need your EVM wallet address so you earn the USDC commissions.\n\n` +
-        `\`/setwallet 0xYourAddress\``,
-      { parse_mode: "Markdown" }
-    );
-    return;
+  const profile = getProfile(userId);
+
+  // Auto-detect country reply during onboarding (short message, no wallet yet)
+  if (!profile.country && !text.startsWith("/")) {
+    const code = parseCountry(text);
+    if (code) {
+      updateProfile(userId, { country: code });
+      await ctx.reply(
+        `✅ Got it — shopping from *${code}*!\n\n` +
+        (profile.wallet
+          ? `You're all set! What are you looking for?`
+          : `Now add your wallet to earn cashback:\n\`/setwallet 0xYourAddress\``),
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
   }
 
   await ctx.replyWithChatAction("typing");
 
   try {
-    const reply = await processMessage(userId, text, wallet);
+    const reply = await processMessage(userId, text, profile.wallet ?? "", profile.country);
     await sendLongMessage(ctx, reply);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unexpected error";
