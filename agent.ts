@@ -101,9 +101,9 @@ const GoalIntentSchema = z.object({
   goal: z.string(),
   intent: z.enum(["travel_booking", "retail_shopping", "product_comparison", "general_question", "dashboard", "off_topic"]).default("general_question"),
   categories: z.array(CategorySchema).default([]),
-  geo: z.string().length(2).optional(),
+  geo: z.string().length(2).nullish(),   // LLM outputs null when no country — nullish() accepts null|undefined
   needs_clarification: z.boolean().default(false),
-  clarification_question: z.string().optional(),
+  clarification_question: z.string().nullish(),
   is_dashboard_query: z.boolean().default(false),
   is_off_topic: z.boolean().default(false),
 });
