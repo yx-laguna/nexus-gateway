@@ -205,144 +205,117 @@ async function runTools(
   intent: GoalIntent,
   walletAddress: string
 ): Promise<EnrichedCategory[]> {
-  // Category → generic fallback query when specific platform returns 0
-  const CATEGORY_FALLBACKS: Record<string, string[]> = {
-    flights:      ["airasia", "trip.com", "travel"],
-    flight:       ["airasia", "trip.com", "travel"],
-    hotels:       ["agoda", "trip.com", "booking"],
-    hotel:        ["agoda", "trip.com", "booking"],
-    activities:   ["klook", "kkday", "experience"],
-    activity:     ["klook", "kkday", "experience"],
-    tours:        ["klook", "kkday"],
-    fashion:      ["shein", "asos", "zalora", "fashion"],
-    apparel:      ["shein", "asos", "zalora"],
-    shopping:     ["shein", "temu", "zalora"],
-    supplements:  ["iherb", "health"],
-    health:       ["iherb", "health"],
-    electronics:  ["lazada", "shopee"],
-    sports:       ["nike", "adidas", "decathlon"],
+  // For each category label, an ordered list of platform slugs to try.
+  // We try each in sequence until one is available AND mintable.
+  const CATEGORY_PLATFORMS: Record<string, string[]> = {
+    flights:     ["trip", "airasia", "airalo"],
+    flight:      ["trip", "airasia", "airalo"],
+    hotels:      ["trip", "agoda", "booking"],
+    hotel:       ["trip", "agoda", "booking"],
+    activities:  ["klook", "kkday", "trip"],
+    activity:    ["klook", "kkday", "trip"],
+    tours:       ["klook", "kkday", "trip"],
+    fashion:     ["nike", "shein", "asos", "crocs"],
+    apparel:     ["nike", "shein", "asos", "crocs"],
+    shopping:    ["shein", "temu", "nike"],
+    supplements: ["iherb"],
+    health:      ["iherb"],
+    electronics: ["lenovo"],
+    sports:      ["nike", "adidas", "crocs"],
   };
 
-  function fallbackQueries(label: string): string[] {
+  function platformsForCategory(label: string, primary: string): string[] {
     const key = label.toLowerCase();
-    return (
-      Object.entries(CATEGORY_FALLBACKS).find(([k]) => key.includes(k))?.[1] ?? ["deals"]
-    );
+    const defaults =
+      Object.entries(CATEGORY_PLATFORMS).find(([k]) => key.includes(k))?.[1] ?? [];
+    // Always try the LLM-chosen platform first, then the category defaults (deduped)
+    return [primary, ...defaults.filter((p) => p !== primary)];
   }
 
-  // Search all platforms in parallel — with category fallback if 0 results
-  const searchResults = await Promise.allSettled(
+  // Deduplicate minted merchants across categories
+  const mintedMerchants = new Set<string>();
+
+  // Per-category: try platforms in order until one mint succeeds
+  const categoryResults = await Promise.allSettled(
     intent.categories.map(async (cat) => {
-      // Primary search — specific platform
-      let found = await searchMerchants({
-        query: cat.platform_search,
-        geo: intent.geo,
-        limit: 3,
-        sort: "relevance",
-      });
+      const platforms = platformsForCategory(cat.label, cat.platform_search);
+      console.log(`[agent] category "${cat.label}" — trying platforms:`, platforms);
 
-      // Fallback: try alternative queries for the same category
-      if (found.length === 0) {
-        console.log(`[agent] 0 results for "${cat.platform_search}" — trying category fallback`);
-        const fallbacks = fallbackQueries(cat.label).filter(
-          (q) => q.toLowerCase() !== cat.platform_search.toLowerCase()
-        );
-        for (const query of fallbacks) {
-          found = await searchMerchants({ query, geo: intent.geo, limit: 3, sort: "cashback_rate" });
-          if (found.length > 0) {
-            console.log(`[agent] fallback "${query}" → ${found.length} result(s):`, found.map((m) => m.id));
-            break;
+      for (const platform of platforms) {
+        // Search Laguna for this platform
+        const merchants = await searchMerchants({
+          query: platform,
+          geo: intent.geo,
+          limit: 3,
+          sort: "relevance",
+        });
+
+        if (merchants.length === 0) {
+          console.log(`[agent] "${platform}" → 0 results, trying next`);
+          continue;
+        }
+
+        console.log(`[agent] "${platform}" → ${merchants.length} result(s):`, merchants.map((m) => m.id));
+
+        // Try each merchant returned for this platform
+        for (const merchant of merchants) {
+          if (mintedMerchants.has(merchant.id)) continue;
+
+          // Check availability
+          const info = await getMerchantInfo({ merchant_id: merchant.id, geo: intent.geo });
+          if (!info || (info as { available?: boolean }).available === false) {
+            console.warn(`[agent] ⚠️ ${merchant.id} not available — trying next`);
+            continue;
           }
+
+          // No wallet → return info only (no link)
+          if (!walletAddress) {
+            mintedMerchants.add(merchant.id);
+            return {
+              label: cat.label,
+              recommendations: cat.recommendations,
+              info,
+              link: { shortlink: "", merchant_id: merchant.id },
+            } satisfies EnrichedCategory;
+          }
+
+          // Mint affiliate link
+          const link = await mintLink({
+            merchant_id: merchant.id,
+            geo: intent.geo,
+            wallet_address: walletAddress,
+          });
+
+          if (!link?.shortlink) {
+            console.warn(`[agent] ⚠️ ${merchant.id} mint returned no shortlink — trying next`);
+            continue;
+          }
+
+          mintedMerchants.add(merchant.id);
+          console.log(`[agent] ✅ minted ${merchant.id} for "${cat.label}":`, link.shortlink);
+          return { label: cat.label, recommendations: cat.recommendations, info, link } satisfies EnrichedCategory;
         }
       }
 
-      return { cat, merchants: found };
+      // All platforms exhausted for this category
+      console.warn(`[agent] ⚠️ no mintable merchant found for "${cat.label}" after trying:`, platforms);
+      throw new Error(`No available merchant for ${cat.label}`);
     })
   );
 
-  // Deduplicate by merchant id, keep best match per category
-  const seen = new Set<string>();
-  const candidates: Array<{
-    label: string;
-    recommendations: string[];
-    merchantId: string;
-    geo?: string;
-  }> = [];
-
-  for (const result of searchResults) {
-    if (result.status !== "fulfilled") {
-      console.error("[agent] merchant search failed:", result.reason);
-      continue;
-    }
-    const { cat, merchants } = result.value;
-    console.log(`[agent] search "${cat.platform_search}" → ${merchants.length} result(s):`, merchants.map((m) => m.id));
-    for (const m of merchants.slice(0, 1)) {
-      if (seen.has(m.id)) continue;
-      seen.add(m.id);
-      candidates.push({
-        label: cat.label,
-        recommendations: cat.recommendations,
-        merchantId: m.id,
-        geo: intent.geo,
-      });
-    }
-  }
-
-  if (candidates.length === 0) {
-    console.warn(`[agent] ⚠️ 0 merchants found — check slugs or Laguna dev merchant list`);
-    return [];
-  }
-
-  // FIX 1: Skip minting entirely if no wallet — Laguna rejects empty wallet_address
-  if (!walletAddress) {
-    console.warn("[agent] ⚠️ no wallet set — skipping mint_link, fetching info only");
-    const infoResults = await Promise.allSettled(
-      candidates.map(async ({ label, recommendations, merchantId, geo }) => {
-        const info = await getMerchantInfo({ merchant_id: merchantId, geo });
-        // FIX 2: skip merchants with no active cashback routes
-        if (!info || (info as { available?: boolean }).available === false) {
-          console.warn(`[agent] ⚠️ ${merchantId} has no active cashback routes — skipping`);
-          throw new Error(`${merchantId} not available`);
-        }
-        return { label, recommendations, info, link: { shortlink: "", merchant_id: merchantId } } satisfies EnrichedCategory;
-      })
-    );
-    return infoResults
-      .filter((r): r is PromiseFulfilledResult<EnrichedCategory> => r.status === "fulfilled")
-      .map((r) => r.value);
-  }
-
-  // Fetch info + mint affiliate links in parallel
-  const enriched = await Promise.allSettled(
-    candidates.map(async ({ label, recommendations, merchantId, geo }) => {
-      // FIX 2: check availability before minting
-      const info = await getMerchantInfo({ merchant_id: merchantId, geo });
-      if (!info || (info as { available?: boolean }).available === false) {
-        console.warn(`[agent] ⚠️ ${merchantId} not available (no active cashback routes) — skipping mint`);
-        throw new Error(`${merchantId} not available`);
-      }
-
-      const link = await mintLink({ merchant_id: merchantId, geo, wallet_address: walletAddress });
-
-      // FIX 3: validate shortlink actually came back
-      if (!link?.shortlink) {
-        console.warn(`[agent] ⚠️ mint_link for ${merchantId} returned no shortlink — skipping`);
-        throw new Error(`${merchantId} mint returned no shortlink`);
-      }
-
-      console.log(`[agent] ✅ minted ${merchantId}:`, link.shortlink);
-      return { label, recommendations, info, link } satisfies EnrichedCategory;
-    })
-  );
-
-  const results = enriched
+  const results = categoryResults
     .filter((r): r is PromiseFulfilledResult<EnrichedCategory> => {
-      if (r.status !== "fulfilled") console.error("[agent] ❌", (r as PromiseRejectedResult).reason);
+      if (r.status !== "fulfilled") {
+        console.error("[agent] ❌", (r as PromiseRejectedResult).reason?.message ?? r);
+      }
       return r.status === "fulfilled";
     })
     .map((r) => r.value);
 
-  console.log(`[agent] ✅ ${results.length}/${candidates.length} links minted successfully`);
+  console.log(`[agent] ✅ ${results.length}/${intent.categories.length} categories resolved`);
+  if (results.length === 0) {
+    console.warn("[agent] ⚠️ 0 merchants resolved — check Laguna dev merchant list");
+  }
   return results;
 }
 
