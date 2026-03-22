@@ -532,6 +532,10 @@ export async function processMessage(
 
     const intent = await extractIntent(history, text);
 
+    // Always prefer the user's stored country over whatever the LLM extracted.
+    // The user set this during onboarding — no need for the LLM to re-detect it.
+    if (userCountry) intent.geo = userCountry;
+
     const hasCategories =
       (intent.intent === "travel_booking" ||
         intent.intent === "retail_shopping" ||
@@ -551,7 +555,6 @@ export async function processMessage(
     } else if (hasCategories) {
       // We have enough to search merchants — always run tools even if dates missing
       console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"}`);
-      if (!intent.geo && userCountry) intent.geo = userCountry;
       const enriched = await runTools(intent, walletAddress);
       reply = buildReply(intent, enriched, !!walletAddress, userCountry);
 
