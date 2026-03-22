@@ -156,15 +156,16 @@ If multiple intents, choose the most explicit one. If unclear, treat as "general
 - Supplements: brand + product, e.g. "Optimum Nutrition Gold Standard Whey"
 - Fashion: brand + item, e.g. "Uniqlo AIRism T-shirt", "Levi's 511 slim jeans"
 
-## Platform search slugs (use EXACTLY these):
-- Flights → "trip" or "airasia" or "airalo"
-- Hotels → "trip" or "agoda" or "booking"
-- Activities/Tours → "klook" or "kkday" or "trip"
-- Fashion/Apparel → "nike" or "shein" or "asos" or "crocs"
+## Platform search slugs (use EXACTLY these verified slugs):
+- Flights → "trip-com"
+- Hotels → "trip-com" or "agoda" or "ihg-amea"
+- Activities/Tours → "klook-pnr" or "kkday"
+- Fashion/Apparel → "shein-global" or "nike" or "zalora" or "crocs"
 - Health/Supplements → "iherb"
-- Electronics → "lenovo" or "samsung"
-- Gifts/General → "temu" or "shein"
-- Luxury Hotels → "trip" or "ihg"
+- Electronics → "lenovo"
+- Gifts/General → "temu" or "shein-global"
+- Luxury → "vertu" or "farfetch"
+- Sports → "nike" or "puma" or "crocs"
 
 Max 4 categories. Output JSON only.`,
     },
@@ -205,23 +206,24 @@ async function runTools(
   intent: GoalIntent,
   walletAddress: string
 ): Promise<EnrichedCategory[]> {
-  // For each category label, an ordered list of platform slugs to try.
-  // We try each in sequence until one is available AND mintable.
+  // For each category label, an ordered list of Laguna merchant slugs to try.
+  // Slugs verified against live Laguna merchant list (search_merchants).
   const CATEGORY_PLATFORMS: Record<string, string[]> = {
-    flights:     ["trip", "airasia", "airalo"],
-    flight:      ["trip", "airasia", "airalo"],
-    hotels:      ["trip", "agoda", "booking"],
-    hotel:       ["trip", "agoda", "booking"],
-    activities:  ["klook", "kkday", "trip"],
-    activity:    ["klook", "kkday", "trip"],
-    tours:       ["klook", "kkday", "trip"],
-    fashion:     ["nike", "shein", "asos", "crocs"],
-    apparel:     ["nike", "shein", "asos", "crocs"],
-    shopping:    ["shein", "temu", "nike"],
+    flights:     ["trip-com", "airalo"],
+    flight:      ["trip-com", "airalo"],
+    hotels:      ["trip-com", "agoda", "ihg-amea"],
+    hotel:       ["trip-com", "agoda", "ihg-amea"],
+    activities:  ["klook-pnr", "kkday"],
+    activity:    ["klook-pnr", "kkday"],
+    tours:       ["klook-pnr", "kkday"],
+    fashion:     ["shein-global", "nike", "zalora", "crocs"],
+    apparel:     ["shein-global", "nike", "zalora", "crocs"],
+    shopping:    ["temu", "shein-global", "zalora"],
     supplements: ["iherb"],
     health:      ["iherb"],
     electronics: ["lenovo"],
-    sports:      ["nike", "adidas", "crocs"],
+    sports:      ["nike", "puma", "crocs"],
+    luxury:      ["vertu", "farfetch"],
   };
 
   function platformsForCategory(label: string, primary: string): string[] {
@@ -375,59 +377,28 @@ function extractPrice(text: string): number | null {
   return parseFloat(m[0].replace(/[$,]/g, ""));
 }
 
-// Typical OTA cashback rates used when Laguna API doesn't return one
-const CATEGORY_DEFAULT_RATES: Array<[string, number]> = [
-  ["hotel",       0.05],
-  ["flight",      0.03],
-  ["activit",     0.06],
-  ["tour",        0.06],
-  ["fashion",     0.08],
-  ["apparel",     0.08],
-  ["supplement",  0.07],
-  ["health",      0.07],
-  ["electronic",  0.04],
-  ["sports",      0.05],
-  ["shopping",    0.06],
-];
-
 /**
- * Return the cashback rate for a merchant/category.
- * Returns { rate, isEstimate: false } if Laguna returned a real rate,
- * { rate, isEstimate: true } if we fell back to a category default.
+ * Extract the real cashback rate from get_merchant_info response.
+ * The API returns: { cashback: { best_rate: 9 } } where 9 means 9%.
  */
 function extractRate(
   info: MerchantInfo,
-  categoryLabel: string
 ): { rate: number; isEstimate: boolean } | null {
-  // 1. Direct cashback_rate field
-  const direct = parseCashbackRate(info?.cashback_rate);
-  if (direct) return { rate: direct, isEstimate: false };
-
-  // 2. rates[] array — Laguna sometimes nests rates here
-  const rates = (info as Record<string, unknown>).rates;
-  if (Array.isArray(rates) && rates.length > 0) {
-    for (const entry of rates) {
-      if (typeof entry === "object" && entry !== null) {
-        const r = entry as Record<string, unknown>;
-        for (const key of ["rate", "cashback_rate", "commission", "commission_rate", "value", "percentage"]) {
-          const parsed = parseCashbackRate(r[key]);
-          if (parsed) return { rate: parsed, isEstimate: false };
-        }
-      } else {
-        const parsed = parseCashbackRate(entry);
-        if (parsed) return { rate: parsed, isEstimate: false };
-      }
-    }
+  // Primary: cashback.best_rate (e.g. 9 → 9% → 0.09)
+  const bestRate = info?.cashback?.best_rate;
+  if (bestRate !== null && bestRate !== undefined) {
+    const n = Number(bestRate);
+    if (!isNaN(n) && n > 0) return { rate: n / 100, isEstimate: false };
   }
 
-  // 3. Category-based fallback (clearly marked as estimate)
-  const key = categoryLabel.toLowerCase();
-  const fallback = CATEGORY_DEFAULT_RATES.find(([k]) => key.includes(k));
-  if (fallback) {
-    console.log(`[agent] no cashback_rate for ${info?.id ?? "?"} — using category default ${(fallback[1] * 100).toFixed(0)}% for "${categoryLabel}"`);
-    return { rate: fallback[1], isEstimate: true };
+  // Fallback: category_rates[0].rate
+  const catRates = info?.cashback?.category_rates;
+  if (Array.isArray(catRates) && catRates.length > 0) {
+    const n = Number(catRates[0].rate);
+    if (!isNaN(n) && n > 0) return { rate: n / 100, isEstimate: false };
   }
 
+  console.warn(`[agent] no cashback rate in get_merchant_info response for ${info?.id ?? "unknown"}`);
   return null;
 }
 
@@ -460,7 +431,7 @@ function buildReply(
       lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
 
       // Cashback math: rate × price extracted from recommendation string
-      const rateInfo = extractRate(matched.info, cat.label);
+      const rateInfo = extractRate(matched.info);
       if (rateInfo) {
         const price = extractPrice(pick);
         if (price) {
@@ -494,7 +465,7 @@ function buildReply(
     const rateItems = enriched
       .filter((e) => e.link?.shortlink)
       .map((e) => {
-        const r = extractRate(e.info, e.label);
+        const r = extractRate(e.info);
         return r ? `${e.info?.name ?? e.label} (${(r.rate * 100).toFixed(0)}%)` : null;
       })
       .filter(Boolean)

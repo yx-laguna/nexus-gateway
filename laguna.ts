@@ -44,6 +44,18 @@ export interface Merchant {
 }
 
 export interface MerchantInfo extends Merchant {
+  /** Top-level availability flag returned by get_merchant_info */
+  available?: boolean;
+  /** Cashback block returned by get_merchant_info */
+  cashback?: {
+    best_rate?: number;           // e.g. 9 means 9%
+    rate_note?: string;
+    category_rates?: Array<{ category: string; rate: number }>;
+    cookie_days?: number;
+    payout_days?: number;
+    available_countries?: string[];
+  };
+  // legacy fields kept for compatibility
   cookie_duration?: string;
   payout_timeline?: string;
   rates?: unknown[];
