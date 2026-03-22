@@ -512,7 +512,7 @@ export async function processMessage(
 
   // Hard timeout — if the whole pipeline takes >55s, fail fast with a friendly message
   // (Telegram webhook expects a response before it retries the update)
-  const PIPELINE_TIMEOUT_MS = 55_000;
+  const PIPELINE_TIMEOUT_MS = 90_000; // 50s LLM + 20s Laguna + buffer
   let timeoutId: ReturnType<typeof setTimeout>;
   const timeoutPromise = new Promise<string>((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error("pipeline timeout")), PIPELINE_TIMEOUT_MS);

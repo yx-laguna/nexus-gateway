@@ -377,7 +377,7 @@ bot.on("message:text", async (ctx: Context) => {
   const SHOPPING_KEYWORDS = /hotel|flight|book|buy|shop|trip|travel|plan|stay|find|search|recommend|cheapest|best|vitamin|supplement|shoe|shirt|bag|watch|phone|laptop|ticket|tour|activity|nike|klook|shein|temu|crocs|puma|iherb|fashion|apparel|deal|price|cheap|affordable/i;
   const isSlowQuery = text.trim().split(/\s+/).length > 3 || SHOPPING_KEYWORDS.test(text);
   if (isSlowQuery) {
-    await ctx.reply("⏳ On it — give me ~30 seconds while I find the best options for you!");
+    await ctx.reply("⏳ On it — give me up to a minute while I find the best options for you!");
   }
   await ctx.replyWithChatAction("typing");
   try {

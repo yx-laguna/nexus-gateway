@@ -24,7 +24,7 @@ function getClient(): OpenAI {
   if (!apiKey) throw new Error("ZG_API_KEY is not set.");
   if (!endpoint) throw new Error("ZG_ENDPOINT is not set.");
 
-  _client = new OpenAI({ baseURL: endpoint, apiKey, timeout: 30_000, maxRetries: 0 });
+  _client = new OpenAI({ baseURL: endpoint, apiKey, timeout: 50_000, maxRetries: 0 });
   console.log("[broker] DeepSeek client ready →", endpoint);
   return _client;
 }
@@ -51,9 +51,12 @@ export async function chat(
       const status = (err as { status?: number })?.status;
       const isRateLimit = status === 429;
       const isServerError = status !== undefined && status >= 500;
+      // Don't retry timeouts — they eat the full timeout window again each attempt
+      const isTimeout = (err as { code?: string })?.code === "ERR_CANCELLED" ||
+        (err instanceof Error && err.message.toLowerCase().includes("timed out"));
 
-      if ((isRateLimit || isServerError) && attempt < retries) {
-        const wait = attempt * 3000; // 3s, 6s, 9s
+      if (!isTimeout && (isRateLimit || isServerError) && attempt < retries) {
+        const wait = attempt * 3000;
         console.warn(`[broker] ${status} on attempt ${attempt} — retrying in ${wait}ms`);
         await sleep(wait);
         continue;
