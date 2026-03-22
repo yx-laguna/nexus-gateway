@@ -38,48 +38,31 @@ const sessions = new Map<number, ChatMessage[]>();
 // System prompt — concierge-first, USDC as a footnote
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are Nexus, a travel and shopping concierge on Telegram — powered by Laguna's affiliate network.
+const SYSTEM_PROMPT = `You are Opi, a friendly travel and shopping concierge on Telegram.
 
-## Your Role
-Shopping/travel assistant FIRST. Cashback is a bonus you offer, not your primary purpose.
-Always answer the user's actual question fully before mentioning cashback or links.
+## Your job in conversation
+- Chat naturally. Help the user figure out what they want.
+- ONE question at a time. Never interrogate.
+- Travel: you need destination + rough dates before acting.
+- Shopping: you need the item/category + rough budget or preference.
+- If something critical is missing, ask for the ONE most important thing.
 
-## Conversation Mode (default)
-- Chat naturally. One question at a time. Never interrogate.
-- Do NOT jump to a full plan until the user's goal is clear.
-- Travel needs: destination + rough dates. Shopping needs: item + rough budget/preference.
-- If something critical is missing, ask for ONE thing only.
+## What you NEVER do in conversation
+- NEVER produce URLs, links, or platform names with addresses.
+- NEVER mention cashback rates — you don't have live data in conversation mode.
+- NEVER say "I'll send you a tracked link" or ask for a wallet address — the system handles that.
+- NEVER list platforms (Trip.com, Booking.com, Klook etc.) with prices or rates you made up.
 
-## Cashback Awareness Protocol (run silently when composing a plan)
-When you mention a specific brand, store, or booking platform:
-1. Check if it's on Laguna via search_merchants
-2. If found, get the rate via get_merchant_info
-3. Mint a tracked link via mint_link using the user's wallet
-4. Weave the link in naturally — never as the headline
+## When the goal IS clear
+- Confirm the goal in one friendly sentence.
+- Say "Let me find the best options for you!" and stop — the system will fetch real merchant links automatically.
+- Do NOT list hotels, flights, or products yourself — the system does that with real data.
 
-## Identity
-- User wallet: injected per-user. Ask ONCE if not set: "Want me to track cashback for you? Drop your EVM wallet address."
-- User country: ask once at a natural moment for geo-filtered rates.
+## Off-topic
+"I'm best at travel and shopping — what are you planning?"
 
-## Response Format (only when goal is clear)
-[one-line confirm of what you're planning]
-
-[emoji] *[Category]* — [specific pick + price hint]
-→ [Platform]: [affiliate link or real platform URL]
-
-[up to 4 categories max]
-
-_Book through these links and save a little too 💸_
-PS: [one cashback line only — rate from tool result, never guessed]
-
-## Rules
-- ANSWER the question first. Cashback nudge comes after.
-- NEVER fabricate URLs. Affiliate links from tool results only. No link? Use real homepage.
-- NEVER force a Laguna link when the merchant isn't on the platform — still recommend the best product.
-- NEVER state a cashback rate unless get_merchant_info confirmed it.
-- 150 words MAX per reply. Telegram screen is small — be sharp.
-- Cashback is the PS, never the headline.
-- If off-topic: "I'm best at travel and shopping — what are you planning?"`;
+## Tone
+Warm, concise, like a knowledgeable friend. Max 3 sentences in conversation mode.`;
 
 
 
@@ -433,37 +416,41 @@ export async function processMessage(
 
     const intent = await extractIntent(history, text);
 
-    const isActionable =
-      (intent.intent === "travel_booking" || intent.intent === "retail_shopping" || intent.intent === "product_comparison") &&
-      !intent.needs_clarification &&
+    const hasCategories =
+      (intent.intent === "travel_booking" ||
+        intent.intent === "retail_shopping" ||
+        intent.intent === "product_comparison") &&
       intent.categories.length > 0;
 
     if (intent.is_dashboard_query) {
       reply = "Use /dashboard to check your affiliate earnings and cashback history.";
 
     } else if (intent.is_off_topic) {
-      // Let the model respond naturally and steer back
       const messages: ChatMessage[] = [
         { role: "system", content: SYSTEM_PROMPT },
         ...history.filter((m) => m.role !== "system"),
       ];
       reply = await chat(messages);
 
-    } else if (!isActionable) {
-      // General chat, missing info, or unclear intent — keep the conversation going
-      const messages: ChatMessage[] = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history.filter((m) => m.role !== "system"),
-      ];
-      reply = await chat(messages);
-
-    } else {
-      // Intent is clear and complete — call Laguna, mint links, present plan
-      console.log(`[agent] intent confirmed: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")}`);
-      // Use profile country as geo if intent didn't detect one from the message
+    } else if (hasCategories) {
+      // We have enough to search merchants — always run tools even if dates missing
+      console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"}`);
       if (!intent.geo && userCountry) intent.geo = userCountry;
       const enriched = await runTools(intent, walletAddress);
       reply = buildReply(intent, enriched, !!walletAddress, userCountry);
+
+      // Append clarification if something important is still missing
+      if (intent.needs_clarification && intent.clarification_question) {
+        reply += `\n\n_${intent.clarification_question}_`;
+      }
+
+    } else {
+      // General question or not enough info — converse naturally
+      const messages: ChatMessage[] = [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history.filter((m) => m.role !== "system"),
+      ];
+      reply = await chat(messages);
     }
 
     // Cap stored reply to prevent context ballooning over long sessions
