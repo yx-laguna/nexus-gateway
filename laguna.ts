@@ -76,6 +76,20 @@ export interface Dashboard {
 }
 
 // ---------------------------------------------------------------------------
+// Timeout helper — every Laguna fetch must resolve within this window
+// ---------------------------------------------------------------------------
+
+const FETCH_TIMEOUT_MS = 20_000; // 20 s per MCP call
+
+function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { ...init, signal: controller.signal }).finally(() =>
+    clearTimeout(timer)
+  );
+}
+
+// ---------------------------------------------------------------------------
 // MCP session initializer
 // ---------------------------------------------------------------------------
 
@@ -93,7 +107,7 @@ async function initSession(): Promise<void> {
 
   console.log("[laguna] initializing MCP session at", MCP_URL);
 
-  const res = await fetch(MCP_URL, {
+  const res = await fetchWithTimeout(MCP_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -117,7 +131,7 @@ async function initSession(): Promise<void> {
   }
 
   // Send initialized notification
-  await fetch(MCP_URL, {
+  await fetchWithTimeout(MCP_URL, {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify({
@@ -164,7 +178,7 @@ async function callTool<T>(
 
   console.log(`[laguna] → ${toolName}`, JSON.stringify(args));
 
-  const res = await fetch(MCP_URL, {
+  const res = await fetchWithTimeout(MCP_URL, {
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(body),

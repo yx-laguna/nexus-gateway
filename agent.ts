@@ -510,6 +510,36 @@ export async function processMessage(
   const history = getHistory(userId);
   history.push({ role: "user", content: text });
 
+  // Hard timeout — if the whole pipeline takes >55s, fail fast with a friendly message
+  // (Telegram webhook expects a response before it retries the update)
+  const PIPELINE_TIMEOUT_MS = 55_000;
+  let timeoutId: ReturnType<typeof setTimeout>;
+  const timeoutPromise = new Promise<string>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error("pipeline timeout")), PIPELINE_TIMEOUT_MS);
+  });
+
+  try {
+    const result = await Promise.race([_processMessage(userId, text, walletAddress, userCountry, history), timeoutPromise]);
+    clearTimeout(timeoutId!);
+    return result;
+  } catch (err) {
+    clearTimeout(timeoutId!);
+    const msg = (err as Error).message ?? "";
+    if (msg === "pipeline timeout") {
+      console.error("[agent] ⏱ pipeline timed out after 55s");
+      return "⏱ That took too long — the AI or merchant API is slow right now. Please try again in a moment.";
+    }
+    throw err;
+  }
+}
+
+async function _processMessage(
+  userId: number,
+  text: string,
+  walletAddress: string,
+  userCountry: string | undefined,
+  history: ChatMessage[]
+): Promise<string> {
   try {
     // Skip intent extraction for short casual greetings only.
     // Any message referencing shopping/products/travel → always extractIntent.

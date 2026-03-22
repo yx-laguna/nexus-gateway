@@ -24,7 +24,7 @@ function getClient(): OpenAI {
   if (!apiKey) throw new Error("ZG_API_KEY is not set.");
   if (!endpoint) throw new Error("ZG_ENDPOINT is not set.");
 
-  _client = new OpenAI({ baseURL: endpoint, apiKey });
+  _client = new OpenAI({ baseURL: endpoint, apiKey, timeout: 30_000, maxRetries: 0 });
   console.log("[broker] DeepSeek client ready →", endpoint);
   return _client;
 }
