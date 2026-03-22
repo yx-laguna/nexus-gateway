@@ -453,8 +453,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         console.error("[bot] failed to parse webhook body:", e);
         return;
       }
-      bot.processUpdate(update as Parameters<typeof bot.processUpdate>[0])
-        .catch((e) => console.error("[bot] processUpdate error:", e));
+      bot.handleUpdate(update as Parameters<typeof bot.handleUpdate>[0])
+        .catch((e) => console.error("[bot] handleUpdate error:", e));
     });
     return;
   }
