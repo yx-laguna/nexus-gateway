@@ -362,7 +362,6 @@ function parseCashbackRate(rate: unknown): number | null {
     ? parseFloat(rate.replace(/%/g, "").trim())
     : Number(rate);
   if (isNaN(n) || n <= 0) return null;
-  // If > 1 treat as a percentage value (e.g. 5 means 5%)
   return n > 1 ? n / 100 : n;
 }
 
@@ -374,6 +373,62 @@ function extractPrice(text: string): number | null {
   const m = text.match(/\$[\d,]+(\.\d+)?/);
   if (!m) return null;
   return parseFloat(m[0].replace(/[$,]/g, ""));
+}
+
+// Typical OTA cashback rates used when Laguna API doesn't return one
+const CATEGORY_DEFAULT_RATES: Array<[string, number]> = [
+  ["hotel",       0.05],
+  ["flight",      0.03],
+  ["activit",     0.06],
+  ["tour",        0.06],
+  ["fashion",     0.08],
+  ["apparel",     0.08],
+  ["supplement",  0.07],
+  ["health",      0.07],
+  ["electronic",  0.04],
+  ["sports",      0.05],
+  ["shopping",    0.06],
+];
+
+/**
+ * Return the cashback rate for a merchant/category.
+ * Returns { rate, isEstimate: false } if Laguna returned a real rate,
+ * { rate, isEstimate: true } if we fell back to a category default.
+ */
+function extractRate(
+  info: MerchantInfo,
+  categoryLabel: string
+): { rate: number; isEstimate: boolean } | null {
+  // 1. Direct cashback_rate field
+  const direct = parseCashbackRate(info?.cashback_rate);
+  if (direct) return { rate: direct, isEstimate: false };
+
+  // 2. rates[] array — Laguna sometimes nests rates here
+  const rates = (info as Record<string, unknown>).rates;
+  if (Array.isArray(rates) && rates.length > 0) {
+    for (const entry of rates) {
+      if (typeof entry === "object" && entry !== null) {
+        const r = entry as Record<string, unknown>;
+        for (const key of ["rate", "cashback_rate", "commission", "commission_rate", "value", "percentage"]) {
+          const parsed = parseCashbackRate(r[key]);
+          if (parsed) return { rate: parsed, isEstimate: false };
+        }
+      } else {
+        const parsed = parseCashbackRate(entry);
+        if (parsed) return { rate: parsed, isEstimate: false };
+      }
+    }
+  }
+
+  // 3. Category-based fallback (clearly marked as estimate)
+  const key = categoryLabel.toLowerCase();
+  const fallback = CATEGORY_DEFAULT_RATES.find(([k]) => key.includes(k));
+  if (fallback) {
+    console.log(`[agent] no cashback_rate for ${info?.id ?? "?"} — using category default ${(fallback[1] * 100).toFixed(0)}% for "${categoryLabel}"`);
+    return { rate: fallback[1], isEstimate: true };
+  }
+
+  return null;
 }
 
 function buildReply(
@@ -390,7 +445,8 @@ function buildReply(
 
   // One block per category + accumulate cashback estimate
   let totalCashback = 0;
-  let cashbackCurrency = "USDC";
+  let anyEstimate = false;
+  const cashbackBreakdown: string[] = [];
 
   for (const cat of intent.categories.slice(0, 4)) {
     const emoji = emojiFor(cat.label);
@@ -403,11 +459,18 @@ function buildReply(
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
 
-      // Accumulate cashback estimate from recommendation price hint
-      const rate = parseCashbackRate(matched.info?.cashback_rate);
-      if (rate) {
+      // Cashback math: rate × price extracted from recommendation string
+      const rateInfo = extractRate(matched.info, cat.label);
+      if (rateInfo) {
         const price = extractPrice(pick);
-        if (price) totalCashback += price * rate;
+        if (price) {
+          const cashback = price * rateInfo.rate;
+          totalCashback += cashback;
+          if (rateInfo.isEstimate) anyEstimate = true;
+          cashbackBreakdown.push(
+            `${name} ${(rateInfo.rate * 100).toFixed(0)}% × $${price} = $${cashback.toFixed(2)}`
+          );
+        }
       }
     } else if (matched) {
       const name = matched.info?.name ?? cat.platform_search;
@@ -419,23 +482,28 @@ function buildReply(
     lines.push(""); // blank line between categories
   }
 
-  // Footer — cashback estimate if we can calculate it, otherwise rate list, otherwise generic
+  // Footer: always show dollar estimate when we have price data
   if (totalCashback > 0.005) {
-    lines.push(`_Book through these links and receive an estimated *$${totalCashback.toFixed(2)} ${cashbackCurrency}* in cashback 💸_`);
+    const estLabel = anyEstimate ? "est. " : "";
+    lines.push(
+      `_Book through these links and receive ${estLabel}*$${totalCashback.toFixed(2)} USDC* in cashback 💸_\n` +
+      `_↳ ${cashbackBreakdown.join(" · ")}_`
+    );
   } else {
-    // Try to at least show rates even if we can't estimate dollars
+    // Fallback: show rate percentages without dollar calc
     const rateItems = enriched
-      .filter((e) => e.link?.shortlink && parseCashbackRate(e.info?.cashback_rate))
+      .filter((e) => e.link?.shortlink)
       .map((e) => {
-        const rate = parseCashbackRate(e.info.cashback_rate)!;
-        return `${e.info.name} (${(rate * 100).toFixed(1)}%)`;
+        const r = extractRate(e.info, e.label);
+        return r ? `${e.info?.name ?? e.label} (${(r.rate * 100).toFixed(0)}%)` : null;
       })
+      .filter(Boolean)
       .slice(0, 3);
 
     if (rateItems.length > 0) {
-      lines.push(`_Book through these links and earn ${cashbackCurrency} cashback — ${rateItems.join(", ")} 💸_`);
+      lines.push(`_Book through these links and earn USDC cashback — ${rateItems.join(", ")} 💸_`);
     } else {
-      lines.push(`_Book through these links and earn ${cashbackCurrency} cashback 💸_`);
+      lines.push(`_Book through these links and earn USDC cashback 💸_`);
     }
   }
 
