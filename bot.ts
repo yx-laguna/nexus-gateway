@@ -310,6 +310,49 @@ bot.on("message:text", async (ctx: Context) => {
 
   const profile = getProfile(userId);
 
+  // ── Gate: if profile incomplete, force onboarding regardless of step ───
+  if (!profile.country || !profile.wallet) {
+    // Set the correct step if not already set
+    if (!profile.onboarding || profile.onboarding === "complete") {
+      if (!profile.country) {
+        updateProfile(userId, { onboarding: "awaiting_country" });
+      } else {
+        updateProfile(userId, { onboarding: "awaiting_wallet" });
+      }
+    }
+
+    const refreshed = getProfile(userId);
+
+    if (refreshed.onboarding === "awaiting_wallet") {
+      if (EVM_ADDRESS_RE.test(text)) {
+        updateProfile(userId, { wallet: text, onboarding: "complete" });
+        await ctx.reply(
+          `✅ *Wallet saved!*\n\`${text}\`\n\nYou're all set 🎉 Tell me where you want to go or what you want to buy!`,
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+      await ctx.reply(
+        `👋 Hey! I'm *Opi* — before we dive in, I need two things to get you the best deals:\n\n` +
+        `🌍 Country: *${refreshed.country}* ✅\n` +
+        `💳 Wallet: not set yet\n\n` +
+        `Please add your EVM wallet address so I can send you cashback:\n\`/setwallet 0xYourAddress\``,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    // awaiting_country
+    await ctx.reply(
+      `👋 Hey! I'm *Opi* — before we dive in, I need two things to get you the best deals:\n\n` +
+      `🌍 *Where are you shopping from?* (e.g. _Singapore_, _Hong Kong_, _United States_)\n` +
+      `💳 *Your EVM wallet address* to receive cashback\n\n` +
+      `Let's start — which country are you in?`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
   // ── Onboarding: awaiting country ────────────────────────────────────────
   if (profile.onboarding === "awaiting_country") {
     const code = parseCountry(text);

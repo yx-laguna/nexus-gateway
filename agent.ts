@@ -157,13 +157,14 @@ If multiple intents, choose the most explicit one. If unclear, treat as "general
 - Fashion: brand + item, e.g. "Uniqlo AIRism T-shirt", "Levi's 511 slim jeans"
 
 ## Platform search slugs (use EXACTLY these):
-- Flights → "airasia" or "trip.com"
-- Hotels → "agoda" or "trip.com" or "hotels.com"
-- Activities/Tours → "klook" or "kkday"
-- Fashion/Apparel → "shein" or "asos" or "farfetch" or "cotton on"
+- Flights → "trip" or "airasia" or "airalo"
+- Hotels → "trip" or "agoda" or "booking"
+- Activities/Tours → "klook" or "kkday" or "trip"
+- Fashion/Apparel → "nike" or "shein" or "asos" or "crocs"
 - Health/Supplements → "iherb"
-- Gifts/General → "temu"
-- Luxury Hotels → "hyatt" or "ihg" or "dusit"
+- Electronics → "lenovo" or "samsung"
+- Gifts/General → "temu" or "shein"
+- Luxury Hotels → "trip" or "ihg"
 
 Max 4 categories. Output JSON only.`,
     },
@@ -287,37 +288,61 @@ async function runTools(
     }
   }
 
+  if (candidates.length === 0) {
+    console.warn(`[agent] ⚠️ 0 merchants found — check slugs or Laguna dev merchant list`);
+    return [];
+  }
+
+  // FIX 1: Skip minting entirely if no wallet — Laguna rejects empty wallet_address
+  if (!walletAddress) {
+    console.warn("[agent] ⚠️ no wallet set — skipping mint_link, fetching info only");
+    const infoResults = await Promise.allSettled(
+      candidates.map(async ({ label, recommendations, merchantId, geo }) => {
+        const info = await getMerchantInfo({ merchant_id: merchantId, geo });
+        // FIX 2: skip merchants with no active cashback routes
+        if (!info || (info as { available?: boolean }).available === false) {
+          console.warn(`[agent] ⚠️ ${merchantId} has no active cashback routes — skipping`);
+          throw new Error(`${merchantId} not available`);
+        }
+        return { label, recommendations, info, link: { shortlink: "", merchant_id: merchantId } } satisfies EnrichedCategory;
+      })
+    );
+    return infoResults
+      .filter((r): r is PromiseFulfilledResult<EnrichedCategory> => r.status === "fulfilled")
+      .map((r) => r.value);
+  }
+
   // Fetch info + mint affiliate links in parallel
   const enriched = await Promise.allSettled(
     candidates.map(async ({ label, recommendations, merchantId, geo }) => {
-      const [info, link] = await Promise.all([
-        getMerchantInfo({ merchant_id: merchantId, geo }),
-        mintLink({ merchant_id: merchantId, geo, wallet_address: walletAddress }),
-      ]);
-      console.log(`[agent] ✅ minted link for ${merchantId}:`, link.shortlink);
+      // FIX 2: check availability before minting
+      const info = await getMerchantInfo({ merchant_id: merchantId, geo });
+      if (!info || (info as { available?: boolean }).available === false) {
+        console.warn(`[agent] ⚠️ ${merchantId} not available (no active cashback routes) — skipping mint`);
+        throw new Error(`${merchantId} not available`);
+      }
+
+      const link = await mintLink({ merchant_id: merchantId, geo, wallet_address: walletAddress });
+
+      // FIX 3: validate shortlink actually came back
+      if (!link?.shortlink) {
+        console.warn(`[agent] ⚠️ mint_link for ${merchantId} returned no shortlink — skipping`);
+        throw new Error(`${merchantId} mint returned no shortlink`);
+      }
+
+      console.log(`[agent] ✅ minted ${merchantId}:`, link.shortlink);
       return { label, recommendations, info, link } satisfies EnrichedCategory;
     })
   );
 
   const results = enriched
     .filter((r): r is PromiseFulfilledResult<EnrichedCategory> => {
-      if (r.status !== "fulfilled") {
-        console.error("[agent] ❌ mint/info failed:", (r as PromiseRejectedResult).reason);
-      }
+      if (r.status !== "fulfilled") console.error("[agent] ❌", (r as PromiseRejectedResult).reason);
       return r.status === "fulfilled";
     })
     .map((r) => r.value);
 
-  // POST-PROCESSING VALIDATION (DeepSeek suggestion 3 — Node.js layer)
-  // If Laguna returned 0 minted links, log clearly so we can diagnose
-  if (results.length === 0 && candidates.length > 0) {
-    console.warn(`[agent] ⚠️ validation: ${candidates.length} candidate(s) found but 0 links minted — Laguna mint failed for all`);
-  } else if (candidates.length === 0) {
-    console.warn(`[agent] ⚠️ validation: 0 merchants found by search — check slugs or Laguna merchant list`);
-  } else {
-    console.log(`[agent] ✅ validation: ${results.length}/${candidates.length} links minted successfully`);
-  }
-
+  console.log(`[agent] ✅ ${results.length}/${candidates.length} links minted successfully`);
   return results;
 }
 
@@ -377,9 +402,13 @@ function buildReply(
       // Laguna-minted affiliate link — the only kind we show
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
+    } else if (matched) {
+      // Merchant found but no shortlink (no wallet set or mint failed)
+      const name = matched.info?.name ?? cat.platform_search;
+      lines.push(`→ via ${name} _(set your wallet to get a cashback link)_`);
     } else {
-      // No Laguna merchant found — show platform name only, no URL
-      lines.push(`→ via ${cat.platform_search} _(affiliate link not available yet)_`);
+      // No merchant found in Laguna for this category
+      lines.push(`→ via ${cat.platform_search} _(not yet on our affiliate network)_`);
     }
 
     lines.push(""); // blank line between categories
