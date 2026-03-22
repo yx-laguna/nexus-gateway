@@ -16,9 +16,9 @@
  */
 
 import "dotenv/config";
-import { createServer } from "http";
+import { createServer, IncomingMessage, ServerResponse } from "http";
 import { readFileSync, writeFileSync } from "fs";
-import { Bot, GrammyError, HttpError, type Context } from "grammy";
+import { Bot, GrammyError, HttpError, webhookCallback, type Context } from "grammy";
 import { processMessage, clearHistory } from "./agent.js";
 import { getDashboard } from "./laguna.js";
 
@@ -399,16 +399,71 @@ bot.catch((err) => {
 });
 
 // ---------------------------------------------------------------------------
-// Health check server (Render free tier requires a listening port)
+// HTTP server — webhook handler + health check
+// Webhook mode avoids the 409 Conflict that happens when two instances
+// briefly overlap during a Render deploy (old + new both long-polling).
 // ---------------------------------------------------------------------------
 
 const PORT = Number(process.env.PORT) || 3000;
-createServer((_, res) => { res.writeHead(200); res.end("OK"); })
-  .listen(PORT, () => console.log(`[bot] Health check on port ${PORT}`));
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? "";
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
+// RENDER_EXTERNAL_URL is set automatically by Render on web services.
+// Falls back to WEBHOOK_URL if you need to override it manually.
+const publicUrl = (process.env.RENDER_EXTERNAL_URL ?? process.env.WEBHOOK_URL ?? "").replace(/\/$/, "");
 
-console.log("[bot] Starting Opi…");
-bot.start({ onStart: (info) => console.log(`[bot] Listening as @${info.username} (id: ${info.id})`) });
+const handleUpdate = webhookCallback(bot, "http");
+
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = req.url ?? "/";
+
+  // Health check
+  if (url === "/" || url === "/health") {
+    res.writeHead(200);
+    res.end("OK");
+    return;
+  }
+
+  // Telegram webhook endpoint
+  if (url === "/webhook") {
+    // Optional secret token validation
+    if (WEBHOOK_SECRET && req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) {
+      res.writeHead(403);
+      res.end("Forbidden");
+      return;
+    }
+    try {
+      await handleUpdate(req, res);
+    } catch (e) {
+      console.error("[bot] webhook handler error:", e);
+      res.writeHead(500);
+      res.end("Internal Server Error");
+    }
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("Not Found");
+});
+
+server.listen(PORT, async () => {
+  console.log(`[bot] HTTP server on port ${PORT}`);
+
+  if (!publicUrl) {
+    // No public URL — fall back to long-polling (local dev)
+    console.log("[bot] No RENDER_EXTERNAL_URL found — starting in long-poll mode (local dev)");
+    await bot.init();
+    console.log(`[bot] Listening as @${bot.botInfo.username} (id: ${bot.botInfo.id})`);
+    bot.start();
+    return;
+  }
+
+  // Register webhook with Telegram
+  const webhookUrl = `${publicUrl}/webhook`;
+  await bot.api.setWebhook(webhookUrl, {
+    secret_token: WEBHOOK_SECRET || undefined,
+    drop_pending_updates: true,   // discard stale updates from while we were down
+  });
+  console.log(`[bot] Webhook registered → ${webhookUrl}`);
+  await bot.init();
+  console.log(`[bot] Listening as @${bot.botInfo.username} (id: ${bot.botInfo.id})`);
+});
