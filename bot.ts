@@ -372,6 +372,7 @@ bot.on("message:text", async (ctx: Context) => {
   }
 
   // ── Fully onboarded — pass to agent ─────────────────────────────────────
+  await ctx.reply("⏳ On it — give me ~30 seconds while I find the best options for you!");
   await ctx.replyWithChatAction("typing");
   try {
     const reply = await processMessage(userId, text, profile.wallet ?? "", profile.country);
