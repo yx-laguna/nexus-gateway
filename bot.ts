@@ -18,7 +18,7 @@
 import "dotenv/config";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { readFileSync, writeFileSync } from "fs";
-import { Bot, GrammyError, HttpError, webhookCallback, type Context } from "grammy";
+import { Bot, GrammyError, HttpError, type Context } from "grammy";
 import { processMessage, clearHistory } from "./agent.js";
 import { getDashboard } from "./laguna.js";
 
@@ -411,8 +411,6 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? "";
 // Falls back to WEBHOOK_URL if you need to override it manually.
 const publicUrl = (process.env.RENDER_EXTERNAL_URL ?? process.env.WEBHOOK_URL ?? "").replace(/\/$/, "");
 
-const handleUpdate = webhookCallback(bot, "http");
-
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = req.url ?? "/";
 
@@ -423,21 +421,34 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     return;
   }
 
-  // Telegram webhook endpoint
+  // Telegram webhook endpoint — respond 200 immediately so Telegram never retries,
+  // then process the update asynchronously in the background.
   if (url === "/webhook") {
-    // Optional secret token validation
     if (WEBHOOK_SECRET && req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) {
       res.writeHead(403);
       res.end("Forbidden");
       return;
     }
-    try {
-      await handleUpdate(req, res);
-    } catch (e) {
-      console.error("[bot] webhook handler error:", e);
-      res.writeHead(500);
-      res.end("Internal Server Error");
-    }
+
+    // Read body
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      // ACK Telegram immediately — this prevents all retries
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{}");
+
+      // Process asynchronously — slow LLM/Laguna calls won't block the ACK
+      let update: Record<string, unknown>;
+      try {
+        update = JSON.parse(Buffer.concat(chunks).toString());
+      } catch (e) {
+        console.error("[bot] failed to parse webhook body:", e);
+        return;
+      }
+      bot.processUpdate(update as Parameters<typeof bot.processUpdate>[0])
+        .catch((e) => console.error("[bot] processUpdate error:", e));
+    });
     return;
   }
 
