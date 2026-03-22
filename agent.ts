@@ -351,6 +351,31 @@ function emojiFor(label: string): string {
     ?? CATEGORY_EMOJI.default;
 }
 
+// ---------------------------------------------------------------------------
+// Cashback estimation helpers
+// ---------------------------------------------------------------------------
+
+/** Parse a cashback rate to a decimal fraction (e.g. "5%" → 0.05, 5 → 0.05, 0.05 → 0.05) */
+function parseCashbackRate(rate: unknown): number | null {
+  if (rate === null || rate === undefined || rate === "") return null;
+  const n = typeof rate === "string"
+    ? parseFloat(rate.replace(/%/g, "").trim())
+    : Number(rate);
+  if (isNaN(n) || n <= 0) return null;
+  // If > 1 treat as a percentage value (e.g. 5 means 5%)
+  return n > 1 ? n / 100 : n;
+}
+
+/**
+ * Extract the first dollar amount from a recommendation string.
+ * Handles: "~$120/night", "from ~$650 return", "($35)", "$1,299"
+ */
+function extractPrice(text: string): number | null {
+  const m = text.match(/\$[\d,]+(\.\d+)?/);
+  if (!m) return null;
+  return parseFloat(m[0].replace(/[$,]/g, ""));
+}
+
 function buildReply(
   intent: GoalIntent,
   enriched: EnrichedCategory[],
@@ -363,7 +388,10 @@ function buildReply(
   // Opening confirm line
   lines.push(`On it — here's your plan for *${intent.goal}*.\n`);
 
-  // One block per category
+  // One block per category + accumulate cashback estimate
+  let totalCashback = 0;
+  let cashbackCurrency = "USDC";
+
   for (const cat of intent.categories.slice(0, 4)) {
     const emoji = emojiFor(cat.label);
     const pick = cat.recommendations[0] ?? cat.label;
@@ -372,42 +400,54 @@ function buildReply(
     lines.push(`${emoji} *${cat.label}* — ${pick}`);
 
     if (matched?.link?.shortlink) {
-      // Laguna-minted affiliate link — the only kind we show
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
+
+      // Accumulate cashback estimate from recommendation price hint
+      const rate = parseCashbackRate(matched.info?.cashback_rate);
+      if (rate) {
+        const price = extractPrice(pick);
+        if (price) totalCashback += price * rate;
+      }
     } else if (matched) {
-      // Merchant found but no shortlink (no wallet set or mint failed)
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ via ${name} _(set your wallet to get a cashback link)_`);
     } else {
-      // No merchant found in Laguna for this category
       lines.push(`→ via ${cat.platform_search} _(not yet on our affiliate network)_`);
     }
 
     lines.push(""); // blank line between categories
   }
 
-  lines.push("_Book through these links and save a little too 💸_");
+  // Footer — cashback estimate if we can calculate it, otherwise rate list, otherwise generic
+  if (totalCashback > 0.005) {
+    lines.push(`_Book through these links and receive an estimated *$${totalCashback.toFixed(2)} ${cashbackCurrency}* in cashback 💸_`);
+  } else {
+    // Try to at least show rates even if we can't estimate dollars
+    const rateItems = enriched
+      .filter((e) => e.link?.shortlink && parseCashbackRate(e.info?.cashback_rate))
+      .map((e) => {
+        const rate = parseCashbackRate(e.info.cashback_rate)!;
+        return `${e.info.name} (${(rate * 100).toFixed(1)}%)`;
+      })
+      .slice(0, 3);
 
-  // PS cashback — only if we have a confirmed rate from tool results
-  const cashbackItems = enriched
-    .filter((e) => e.info?.cashback_rate)
-    .map((e) => `${e.info.name} (${e.info.cashback_rate} cashback)`)
-    .slice(0, 2);
-
-  if (cashbackItems.length > 0) {
-    lines.push(`PS: Earn USDC cashback via ${cashbackItems.join(", ")}.`);
+    if (rateItems.length > 0) {
+      lines.push(`_Book through these links and earn ${cashbackCurrency} cashback — ${rateItems.join(", ")} 💸_`);
+    } else {
+      lines.push(`_Book through these links and earn ${cashbackCurrency} cashback 💸_`);
+    }
   }
 
-  // Country reminder — shown when geo was used so user knows to update if needed
+  // Country reminder
   if (userCountry) {
-    lines.push(`\n_Links are curated for *${userCountry}*. Shopping from somewhere else? Just let me know or update with \`/setcountry\`._`);
+    lines.push(`\n_Links curated for *${userCountry}*. Somewhere else? \`/setcountry\`_`);
   }
 
-  // Wallet nudge — only shown when no wallet is set yet
+  // Wallet nudge — only when no wallet set
   if (!hasWallet) {
     lines.push(
-      `\n💳 *Want to earn cashback on these?*\nSave your EVM wallet and I'll track your USDC commissions:\n\`/setwallet 0xYourAddress\``
+      `\n💳 *Want to earn cashback on these?*\nSave your EVM wallet and I'll track your USDC:\n\`/setwallet 0xYourAddress\``
     );
   }
 
