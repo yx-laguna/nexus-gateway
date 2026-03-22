@@ -310,83 +310,62 @@ bot.on("message:text", async (ctx: Context) => {
 
   const profile = getProfile(userId);
 
-  // ── Gate: if profile incomplete, force onboarding regardless of step ───
-  if (!profile.country || !profile.wallet) {
-    // Set the correct step if not already set
-    if (!profile.onboarding || profile.onboarding === "complete") {
-      if (!profile.country) {
-        updateProfile(userId, { onboarding: "awaiting_country" });
-      } else {
-        updateProfile(userId, { onboarding: "awaiting_wallet" });
-      }
-    }
+  // ── Onboarding: always try to extract country + wallet from message first ─
+  // Extract wallet address anywhere in the message
+  const walletInMessage = (text.match(/0x[0-9a-fA-F]{40}/) ?? [])[0] ?? null;
+  // Strip wallet from text before trying to parse country
+  const textWithoutWallet = text.replace(/0x[0-9a-fA-F]{40}/g, "").trim();
 
-    const refreshed = getProfile(userId);
+  // ── Step: need country ───────────────────────────────────────────────────
+  if (!profile.country) {
+    const code = parseCountry(textWithoutWallet || text);
 
-    if (refreshed.onboarding === "awaiting_wallet") {
-      if (EVM_ADDRESS_RE.test(text)) {
-        updateProfile(userId, { wallet: text, onboarding: "complete" });
-        await ctx.reply(
-          `✅ *Wallet saved!*\n\`${text}\`\n\nYou're all set 🎉 Tell me where you want to go or what you want to buy!`,
-          { parse_mode: "Markdown" }
-        );
-        return;
-      }
-      await ctx.reply(
-        `👋 Hey! I'm *Opi* — before we dive in, I need two things to get you the best deals:\n\n` +
-        `🌍 Country: *${refreshed.country}* ✅\n` +
-        `💳 Wallet: not set yet\n\n` +
-        `Please add your EVM wallet address so I can send you cashback:\n\`/setwallet 0xYourAddress\``,
-        { parse_mode: "Markdown" }
-      );
-      return;
-    }
-
-    // awaiting_country
-    await ctx.reply(
-      `👋 Hey! I'm *Opi* — before we dive in, I need two things to get you the best deals:\n\n` +
-      `🌍 *Where are you shopping from?* (e.g. _Singapore_, _Hong Kong_, _United States_)\n` +
-      `💳 *Your EVM wallet address* to receive cashback\n\n` +
-      `Let's start — which country are you in?`,
-      { parse_mode: "Markdown" }
-    );
-    return;
-  }
-
-  // ── Onboarding: awaiting country ────────────────────────────────────────
-  if (profile.onboarding === "awaiting_country") {
-    const code = parseCountry(text);
     if (!code) {
+      // Nothing parseable — show onboarding prompt
       await ctx.reply(
-        `I didn't catch that country 😅\n\nTry typing the full name, e.g:\n_Singapore_, _Hong Kong_, _United States_`,
+        `👋 Hey! I'm *Opi* — before we dive in I need two quick things:\n\n` +
+        `🌍 *Where are you shopping from?*\n_(e.g. Singapore, Hong Kong, United States)_\n\n` +
+        `💳 *Your EVM wallet address* to receive cashback\n_(e.g. 0xAbCd…1234)_\n\n` +
+        `You can send both in one message!`,
         { parse_mode: "Markdown" }
       );
       return;
     }
-    updateProfile(userId, { country: code, onboarding: "awaiting_wallet" });
+
+    // Country found — save it, also save wallet if in same message
+    const update: Partial<UserProfile> = { country: code };
+    if (walletInMessage) { update.wallet = walletInMessage; update.onboarding = "complete"; }
+    else { update.onboarding = "awaiting_wallet"; }
+    updateProfile(userId, update);
+
+    if (update.onboarding === "complete") {
+      await ctx.reply(
+        `✅ All set! *${code}* + wallet saved 🎉\n\nTell me where you want to go or what you want to buy!`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
     await ctx.reply(
       `🌍 Got it — *${code}*!\n\n` +
-      `Now, to send your cashback and rewards, I'll need your *EVM wallet address*:\n\n\`/setwallet 0xYourAddress\`\n\n` +
-      `_Don't have one? Create a free wallet on MetaMask or Coinbase Wallet._`,
+      `Now paste your *EVM wallet address* to receive cashback:\n_(e.g. \`0xAbCd…1234\`)_`,
       { parse_mode: "Markdown" }
     );
     return;
   }
 
-  // ── Onboarding: awaiting wallet (nudge them to use /setwallet) ───────────
-  if (profile.onboarding === "awaiting_wallet") {
-    // Check if they pasted a raw wallet address without the command
-    if (EVM_ADDRESS_RE.test(text)) {
-      updateProfile(userId, { wallet: text, onboarding: "complete" });
+  // ── Step: need wallet ────────────────────────────────────────────────────
+  if (!profile.wallet) {
+    if (walletInMessage) {
+      updateProfile(userId, { wallet: walletInMessage, onboarding: "complete" });
       await ctx.reply(
-        `✅ *Wallet saved!*\n\`${text}\`\n\n` +
-        `You're all set 🎉 Tell me where you want to go or what you want to buy!`,
+        `✅ *Wallet saved!*\n\`${walletInMessage}\`\n\nYou're all set 🎉 Tell me where you want to go or what you want to buy!`,
         { parse_mode: "Markdown" }
       );
       return;
     }
     await ctx.reply(
-      `Almost there! I just need your EVM wallet address to send you cashback:\n\n\`/setwallet 0xYourAddress\``,
+      `Almost there! Just paste your *EVM wallet address* to receive cashback:\n_(e.g. \`0xAbCd…1234\`) or use \`/setwallet 0xYourAddress\`_`,
       { parse_mode: "Markdown" }
     );
     return;
