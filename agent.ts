@@ -213,29 +213,56 @@ async function runTools(
   // For each category label, an ordered list of Laguna merchant slugs to try.
   // Slugs verified against live Laguna merchant list (search_merchants).
   const CATEGORY_PLATFORMS: Record<string, string[]> = {
-    flights:     ["trip-com", "airalo"],
-    flight:      ["trip-com", "airalo"],
-    hotels:      ["trip-com", "agoda", "ihg-amea"],
-    hotel:       ["trip-com", "agoda", "ihg-amea"],
-    activities:  ["klook-pnr", "kkday"],
-    activity:    ["klook-pnr", "kkday"],
-    tours:       ["klook-pnr", "kkday"],
-    fashion:     ["shein-global", "nike", "zalora", "crocs"],
-    apparel:     ["shein-global", "nike", "zalora", "crocs"],
-    shopping:    ["temu", "shein-global", "zalora"],
-    supplements: ["iherb"],
-    health:      ["iherb"],
-    electronics: ["lenovo"],
-    sports:      ["nike", "puma", "crocs"],
-    luxury:      ["vertu", "farfetch"],
+    flights:        ["trip-com", "airalo"],
+    flight:         ["trip-com", "airalo"],
+    hotels:         ["trip-com", "agoda", "ihg-amea"],
+    hotel:          ["trip-com", "agoda", "ihg-amea"],
+    activities:     ["klook-pnr", "kkday"],
+    activity:       ["klook-pnr", "kkday"],
+    tours:          ["klook-pnr", "kkday"],
+    // Niche travel — all route through trip-com
+    cruises:        ["trip-com"],
+    cruise:         ["trip-com"],
+    "car rental":   ["trip-com"],
+    "car rentals":  ["trip-com"],
+    ferry:          ["trip-com"],
+    rail:           ["trip-com"],
+    train:          ["trip-com"],
+    "theme park":   ["klook-pnr", "kkday", "trip-com"],
+    "theme parks":  ["klook-pnr", "kkday", "trip-com"],
+    transfer:       ["trip-com", "klook-pnr"],
+    transport:      ["trip-com", "klook-pnr"],
+    // Retail
+    fashion:        ["shein-global", "nike", "zalora", "crocs"],
+    apparel:        ["shein-global", "nike", "zalora", "crocs"],
+    shopping:       ["temu", "shein-global", "zalora"],
+    supplements:    ["iherb"],
+    health:         ["iherb"],
+    electronics:    ["lenovo"],
+    sports:         ["nike", "puma", "crocs"],
+    luxury:         ["vertu", "farfetch"],
   };
+
+  // Keywords used to auto-append safety-net fallbacks for unlisted categories
+  const TRAVEL_RE   = /hotel|flight|travel|trip|cruise|tour|activit|transport|transfer|ferry|train|rail|car\s*rent|accommodation/i;
+  const SHOPPING_RE = /shop|fashion|apparel|cloth|wear|bag|shoe|accessor|gift|beauty|cosmetic/i;
 
   function platformsForCategory(label: string, primary: string): string[] {
     const key = label.toLowerCase();
     const defaults =
       Object.entries(CATEGORY_PLATFORMS).find(([k]) => key.includes(k))?.[1] ?? [];
-    // Always try the LLM-chosen platform first, then the category defaults (deduped)
-    return [primary, ...defaults.filter((p) => p !== primary)];
+    const list = [primary, ...defaults.filter((p) => p !== primary)];
+
+    // Safety-net: any unrecognised travel category → append trip-com as last resort
+    if (TRAVEL_RE.test(label) && !list.includes("trip-com")) {
+      list.push("trip-com");
+    }
+    // Safety-net: any unrecognised shopping category → append shein-global / temu
+    if (SHOPPING_RE.test(label) && !list.some((p) => ["shein-global", "temu", "nike"].includes(p))) {
+      list.push("shein-global", "temu");
+    }
+
+    return list;
   }
 
   // Deduplicate minted merchants across categories
