@@ -95,6 +95,8 @@ function parseCountry(input: string): string | null {
 }
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const TON_ADDRESS_RE = /^[UEk0][Qq][A-Za-z0-9_-]{46}$/;
+const WALLET_RE     = /0x[0-9a-fA-F]{40}|[UEk0][Qq][A-Za-z0-9_-]{46}/;
 
 // ---------------------------------------------------------------------------
 // Bot setup
@@ -146,9 +148,11 @@ bot.command("setwallet", async (ctx: Context) => {
   const parts = ctx.message?.text?.trim().split(/\s+/);
   const address = parts?.[1];
 
-  if (!address || !EVM_ADDRESS_RE.test(address)) {
+  if (!address || (!EVM_ADDRESS_RE.test(address) && !TON_ADDRESS_RE.test(address))) {
     await ctx.reply(
-      `⚠️ Please provide a valid EVM wallet address.\n\nExample:\n\`/setwallet 0xAbCd...1234\``,
+      `⚠️ Please provide a valid EVM or TON wallet address.\n\n` +
+      `EVM: \`/setwallet 0xAbCd...1234\`\n` +
+      `TON: \`/setwallet UQAbCd...1234\``,
       { parse_mode: "Markdown" }
     );
     return;
@@ -220,7 +224,7 @@ bot.command("mywallet", async (ctx: Context) => {
   await ctx.reply(
     `*Your Opi Profile*\n\n` +
     `🌍 Country: ${profile.country ? `*${profile.country}*` : `not set — \`/setcountry Singapore\``}\n` +
-    `💳 Wallet: ${profile.wallet ? `\`${profile.wallet}\`` : `not set — \`/setwallet 0xYourAddress\``}`,
+    `💳 Wallet: ${profile.wallet ? `\`${profile.wallet}\`` : `not set — \`/setwallet 0x... or UQ...\``}`,
     { parse_mode: "Markdown" }
   );
 });
@@ -245,7 +249,7 @@ bot.command("dashboard", async (ctx: Context) => {
 
   const { wallet } = getProfile(userId);
   if (!wallet) {
-    await ctx.reply(`Set your wallet first:\n\`/setwallet 0xYourAddress\``, { parse_mode: "Markdown" });
+    await ctx.reply(`Set your wallet first:\n\`/setwallet 0x...\` (EVM) or \`/setwallet UQ...\` (TON)`, { parse_mode: "Markdown" });
     return;
   }
 
@@ -261,7 +265,7 @@ bot.command("dashboard", async (ctx: Context) => {
       `💰 Balance: *${balance}*\n` +
       `🔗 Conversions: *${conversions}*\n\n` +
       `Wallet: \`${wallet}\`\n` +
-      `_Payouts settle in USDC on Base chain_`,
+      `_Payouts sent to your wallet_`,
       { parse_mode: "Markdown" }
     );
   } catch (err) {
@@ -312,9 +316,9 @@ bot.on("message:text", async (ctx: Context) => {
 
   // ── Onboarding: always try to extract country + wallet from message first ─
   // Extract wallet address anywhere in the message
-  const walletInMessage = (text.match(/0x[0-9a-fA-F]{40}/) ?? [])[0] ?? null;
+  const walletInMessage = (text.match(WALLET_RE) ?? [])[0] ?? null;
   // Strip wallet from text before trying to parse country
-  const textWithoutWallet = text.replace(/0x[0-9a-fA-F]{40}/g, "").trim();
+  const textWithoutWallet = text.replace(WALLET_RE, "").trim();
 
   // ── Step: need country ───────────────────────────────────────────────────
   if (!profile.country) {
@@ -325,7 +329,7 @@ bot.on("message:text", async (ctx: Context) => {
       await ctx.reply(
         `👋 Hey! I'm *Opi* — before we dive in I need two quick things:\n\n` +
         `🌍 *Where are you shopping from?*\n_(e.g. Singapore, Hong Kong, United States)_\n\n` +
-        `💳 *Your EVM wallet address* to receive cashback\n_(e.g. 0xAbCd…1234)_\n\n` +
+        `💳 *Your EVM or TON wallet address* to receive cashback\n_(e.g. \`0xAbCd…1234\` or \`UQAbCd…1234\`)_\n\n` +
         `You can send both in one message!`,
         { parse_mode: "Markdown" }
       );
@@ -348,7 +352,7 @@ bot.on("message:text", async (ctx: Context) => {
 
     await ctx.reply(
       `🌍 Got it — *${code}*!\n\n` +
-      `Now paste your *EVM wallet address* to receive cashback:\n_(e.g. \`0xAbCd…1234\`)_`,
+      `Now paste your *EVM or TON wallet address* to receive cashback:\n_(EVM: \`0xAbCd…1234\` · TON: \`UQAbCd…1234\`)_`,
       { parse_mode: "Markdown" }
     );
     return;
@@ -365,7 +369,7 @@ bot.on("message:text", async (ctx: Context) => {
       return;
     }
     await ctx.reply(
-      `Almost there! Just paste your *EVM wallet address* to receive cashback:\n_(e.g. \`0xAbCd…1234\`) or use \`/setwallet 0xYourAddress\`_`,
+      `Almost there! Just paste your *EVM or TON wallet address* to receive cashback:\n_(EVM: \`0xAbCd…1234\` · TON: \`UQAbCd…1234\`)_`,
       { parse_mode: "Markdown" }
     );
     return;
