@@ -20,11 +20,8 @@ import "dotenv/config";
 // Config
 // ---------------------------------------------------------------------------
 
-// DEV environment — limited merchants, categories not fully tagged.
-// Switch LAGUNA_MCP_URL to the production endpoint when Laguna goes live.
-// Full merchant catalogue + category filters will work correctly in prod.
 const MCP_URL =
-  process.env.LAGUNA_MCP_URL ?? "https://agents-dev.laguna.network/mcp";
+  process.env.LAGUNA_MCP_URL ?? "https://agents.laguna.network/mcp";
 
 let _requestId = 1;
 let _sessionId: string | null = null;
