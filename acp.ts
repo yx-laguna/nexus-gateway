@@ -13,6 +13,7 @@ import {
   AcpAgent,
   PrivyAlchemyEvmProviderAdapter,
   AssetToken,
+  SocketTransport,
 } from "@virtuals-protocol/acp-node-v2";
 import type { JobSession, JobRoomEntry } from "@virtuals-protocol/acp-node-v2";
 import { baseSepolia } from "@account-kit/infra";
@@ -55,6 +56,7 @@ export function isAcpReady(): boolean { return acpStarted; }
 
 export async function initAcp(): Promise<void> {
   acpClient = await AcpAgent.create({
+    transport: new SocketTransport(),   // SSE silently swallows connect errors; Socket rejects properly
     provider: await PrivyAlchemyEvmProviderAdapter.create({
       walletAddress: CLIENT_WALLET(),
       walletId: CLIENT_PRIVY_ID(),
