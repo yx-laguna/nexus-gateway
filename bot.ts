@@ -471,25 +471,24 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 server.listen(PORT, async () => {
   console.log(`[bot] HTTP server on port ${PORT}`);
 
-  // Start ACP client (for mint-affiliate-link calls via the provider agent)
-  await initAcp();
-
+  // Register Telegram webhook / start polling FIRST — don't block on ACP init
   if (!publicUrl) {
-    // No public URL — fall back to long-polling (local dev)
-    console.log("[bot] No RENDER_EXTERNAL_URL found — starting in long-poll mode (local dev)");
+    console.log("[bot] No RENDER_EXTERNAL_URL — long-poll mode (local dev)");
     await bot.init();
     console.log(`[bot] Listening as @${bot.botInfo.username} (id: ${bot.botInfo.id})`);
     bot.start();
-    return;
+  } else {
+    const webhookUrl = `${publicUrl}/webhook`;
+    await bot.api.setWebhook(webhookUrl, {
+      secret_token: WEBHOOK_SECRET || undefined,
+      drop_pending_updates: true,
+    });
+    await bot.init();
+    console.log(`[bot] Webhook registered → ${webhookUrl} (@${bot.botInfo.username})`);
   }
 
-  // Register webhook with Telegram
-  const webhookUrl = `${publicUrl}/webhook`;
-  await bot.api.setWebhook(webhookUrl, {
-    secret_token: WEBHOOK_SECRET || undefined,
-    drop_pending_updates: true,   // discard stale updates from while we were down
-  });
-  console.log(`[bot] Webhook registered → ${webhookUrl}`);
-  await bot.init();
-  console.log(`[bot] Listening as @${bot.botInfo.username} (id: ${bot.botInfo.id})`);
+  // Start ACP client in background — messages will queue until it's ready
+  initAcp().catch((err) =>
+    console.error("[acp] init failed:", err instanceof Error ? err.message : err)
+  );
 });
