@@ -379,11 +379,15 @@ bot.on("message:text", async (ctx: Context) => {
   const SHOPPING_KEYWORDS = /hotel|flight|book|buy|shop|trip|travel|plan|stay|find|search|recommend|cheapest|best|vitamin|supplement|shoe|shirt|bag|watch|phone|laptop|ticket|tour|activity|nike|klook|shein|temu|crocs|puma|iherb|fashion|apparel|deal|price|cheap|affordable/i;
   const isSlowQuery = text.trim().split(/\s+/).length > 3 || SHOPPING_KEYWORDS.test(text);
   if (isSlowQuery) {
-    await ctx.reply("⏳ On it — give me up to a minute while I find the best options for you!");
+    await ctx.reply("⏳ On it! Finding the best options and minting your affiliate link via ACP — I'll send the link separately once it's confirmed.");
   }
   await ctx.replyWithChatAction("typing");
   try {
-    const reply = await processMessage(userId, text, profile.wallet ?? "", profile.country);
+    const chatId = ctx.chat!.id;
+    const onFollowUp = async (msg: string) => {
+      await bot.api.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+    };
+    const reply = await processMessage(userId, text, profile.wallet ?? "", profile.country, onFollowUp);
     await sendLongMessage(ctx, reply);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unexpected error";

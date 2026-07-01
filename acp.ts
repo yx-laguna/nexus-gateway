@@ -44,8 +44,10 @@ interface Pending {
 
 const pending = new Map<string, Pending>();
 let acpClient: Awaited<ReturnType<typeof AcpAgent.create>> | null = null;
+let acpStarted = false;
 
-export function isAcpReady(): boolean { return acpClient !== null; }
+/** Returns true only after acpClient.start() has resolved — safe to call acpMintLink */
+export function isAcpReady(): boolean { return acpStarted; }
 
 // ---------------------------------------------------------------------------
 // Init — call once at startup
@@ -103,7 +105,8 @@ export async function initAcp(): Promise<void> {
   });
 
   await acpClient.start();
-  console.log("[acp] ACP client started");
+  acpStarted = true;
+  console.log("[acp] ACP client started — ready for mint jobs");
 }
 
 // ---------------------------------------------------------------------------

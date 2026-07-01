@@ -22,11 +22,10 @@ import { chat, type ChatMessage } from "./broker.js";
 import {
   searchMerchants,
   getMerchantInfo,
-  mintLink,
   type MerchantInfo,
   type MintedLink,
 } from "./laguna.js";
-import { acpMintLink, isAcpReady } from "./acp.js";
+import { acpMintLink } from "./acp.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -204,7 +203,8 @@ export interface EnrichedCategory {
   label: string;
   recommendations: string[];
   info: MerchantInfo;
-  link: MintedLink;
+  link: MintedLink | null;       // null = ACP job in flight
+  acpJob?: Promise<MintedLink>;  // resolves when ACP settles
 }
 
 async function runTools(
@@ -302,32 +302,17 @@ async function runTools(
             continue;
           }
 
-          // Mint affiliate link — use ACP agent if ready, else direct Laguna
-          let link: MintedLink;
-          if (isAcpReady()) {
-            console.log(`[agent] minting ${merchant.id} via ACP`);
-            link = await acpMintLink({
-              merchant_id: merchant.id,
-              geo: intent.geo,
-              caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
-            });
-          } else {
-            console.log(`[agent] ACP not ready — minting ${merchant.id} directly via Laguna`);
-            link = await mintLink({
-              merchant_id: merchant.id,
-              geo: intent.geo ?? undefined,
-              wallet_address: walletAddress ?? undefined,
-            });
-          }
-
-          if (!link?.shortlink) {
-            console.warn(`[agent] ⚠️ ${merchant.id} mint returned no shortlink — trying next`);
-            continue;
-          }
+          // Fire ACP job — non-blocking, link delivered via follow-up message
+          console.log(`[agent] firing ACP job for ${merchant.id}`);
+          const acpJob = acpMintLink({
+            merchant_id: merchant.id,
+            geo: intent.geo,
+            caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
+          });
 
           mintedMerchants.add(merchant.id);
-          console.log(`[agent] ✅ minted ${merchant.id} for "${cat.label}":`, link.shortlink);
-          return { label: cat.label, recommendations: cat.recommendations, info, link } satisfies EnrichedCategory;
+          console.log(`[agent] ✅ ACP job started for "${cat.label}" (${merchant.id})`);
+          return { label: cat.label, recommendations: cat.recommendations, info, link: null, acpJob } satisfies EnrichedCategory;
         }
       }
 
@@ -475,6 +460,12 @@ function buildReply(
           );
         }
       }
+    } else if (matched?.acpJob) {
+      // ACP job in flight — link arriving separately
+      const name = matched.info?.name ?? cat.platform_search;
+      const rateInfo = extractRate(matched.info);
+      const rateStr = rateInfo ? ` · ${(rateInfo.rate * 100).toFixed(0)}% cashback` : "";
+      lines.push(`→ via *${name}*${rateStr}\n_⏳ Minting your affiliate link via ACP agent — sending shortly!_`);
     } else if (matched) {
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ via ${name} _(set your wallet to get a cashback link)_`);
@@ -532,29 +523,31 @@ function buildReply(
 export async function processMessage(
   userId: number,
   text: string,
-  walletAddress: string,   // empty string means no wallet set yet
-  userCountry?: string     // ISO alpha-2, e.g. "SG" — from user profile
+  walletAddress: string,      // empty string means no wallet set yet
+  userCountry?: string,       // ISO alpha-2, e.g. "SG"
+  onFollowUp?: (msg: string) => Promise<void>  // called when ACP links settle
 ): Promise<string> {
   const history = getHistory(userId);
   history.push({ role: "user", content: text });
 
-  // Hard timeout — if the whole pipeline takes >55s, fail fast with a friendly message
-  // (Telegram webhook expects a response before it retries the update)
-  const PIPELINE_TIMEOUT_MS = 90_000; // 50s LLM + 20s Laguna + buffer
+  // Timeout covers only the fast path (LLM + Laguna search); ACP runs beyond this
+  const PIPELINE_TIMEOUT_MS = 30_000;
   let timeoutId: ReturnType<typeof setTimeout>;
   const timeoutPromise = new Promise<string>((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error("pipeline timeout")), PIPELINE_TIMEOUT_MS);
   });
 
   try {
-    const result = await Promise.race([_processMessage(userId, text, walletAddress, userCountry, history), timeoutPromise]);
+    const result = await Promise.race(
+      [_processMessage(userId, text, walletAddress, userCountry, history, onFollowUp), timeoutPromise]
+    );
     clearTimeout(timeoutId!);
     return result;
   } catch (err) {
     clearTimeout(timeoutId!);
     const msg = (err as Error).message ?? "";
     if (msg === "pipeline timeout") {
-      console.error("[agent] ⏱ pipeline timed out after 55s");
+      console.error("[agent] ⏱ pipeline timed out after 30s");
       return "⏱ That took too long — the AI or merchant API is slow right now. Please try again in a moment.";
     }
     throw err;
@@ -566,7 +559,8 @@ async function _processMessage(
   text: string,
   walletAddress: string,
   userCountry: string | undefined,
-  history: ChatMessage[]
+  history: ChatMessage[],
+  onFollowUp?: (msg: string) => Promise<void>
 ): Promise<string> {
   try {
     // Skip intent extraction for short casual greetings only.
@@ -615,6 +609,25 @@ async function _processMessage(
       console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"}`);
       const enriched = await runTools(intent, walletAddress);
       reply = buildReply(intent, enriched, !!walletAddress, userCountry);
+
+      // For each ACP job in flight, send follow-up when it settles
+      if (onFollowUp) {
+        for (const cat of enriched) {
+          if (!cat.acpJob) continue;
+          const merchantName = cat.info?.name ?? cat.label;
+          cat.acpJob.then((minted) => {
+            console.log(`[acp] ✅ follow-up link ready for ${merchantName}:`, minted.shortlink);
+            const rateInfo = extractRate(cat.info);
+            const rateStr = rateInfo ? ` · earn *${(rateInfo.rate * 100).toFixed(0)}% cashback*` : "";
+            return onFollowUp(
+              `🔗 *Your ${merchantName} affiliate link is ready!*${rateStr}\n\n${minted.shortlink}\n\n_via Laguna ACP agent_ ✅`
+            );
+          }).catch((err) => {
+            console.error(`[acp] follow-up failed for ${merchantName}:`, err instanceof Error ? err.message : err);
+            onFollowUp(`⚠️ Couldn't mint the ${merchantName} link via ACP: ${err instanceof Error ? err.message : err}`).catch(() => {});
+          });
+        }
+      }
 
       // Append clarification if something important is still missing
       if (intent.needs_clarification && intent.clarification_question) {
