@@ -113,6 +113,8 @@ export async function initAcp(): Promise<void> {
 // acpMintLink — drop-in replacement for laguna.mintLink for the mint step
 // ---------------------------------------------------------------------------
 
+const ACP_TOTAL_TIMEOUT_MS = 120_000; // 2 min hard ceiling — covers browseAgents + job wait
+
 export async function acpMintLink(params: {
   merchant_id: string;
   geo?: string | null;
@@ -120,8 +122,20 @@ export async function acpMintLink(params: {
 }): Promise<MintedLink> {
   if (!acpClient) throw new Error("[acp] ACP client not initialised — call initAcp() first");
 
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`[acp] acpMintLink timed out after ${ACP_TOTAL_TIMEOUT_MS / 1000}s`)), ACP_TOTAL_TIMEOUT_MS)
+  );
+
+  return Promise.race([_acpMintLink(params), timeoutPromise]);
+}
+
+async function _acpMintLink(params: {
+  merchant_id: string;
+  geo?: string | null;
+  caller_tag?: string;
+}): Promise<MintedLink> {
   const providerAddr = PROVIDER_ADDR();
-  const agents = await acpClient.browseAgents("Laguna Affiliate", { topK: 5 });
+  const agents = await acpClient!.browseAgents("Laguna Affiliate", { topK: 5 });
   const provider = agents.find(
     (a) => a.walletAddress.toLowerCase() === providerAddr,
   );
@@ -136,12 +150,12 @@ export async function acpMintLink(params: {
   if (params.geo) requirement.geo = params.geo.toUpperCase();
   if (params.caller_tag) requirement.caller_tag = params.caller_tag;
 
-  const jobId = await acpClient.createJobFromOffering(
+  const jobId = await acpClient!.createJobFromOffering(
     baseSepolia.id,
     offering,
     provider.walletAddress,
     requirement,
-    { evaluatorAddress: await acpClient.getAddress() },
+    { evaluatorAddress: await acpClient!.getAddress() },
   );
 
   console.log(`[acp] job ${jobId} created for merchant=${params.merchant_id} geo=${params.geo ?? "SG"}`);
@@ -151,7 +165,7 @@ export async function acpMintLink(params: {
     setTimeout(() => {
       if (pending.has(jobId)) {
         pending.delete(jobId);
-        reject(new Error(`[acp] Job ${jobId} timed out (90s)`));
+        reject(new Error(`[acp] Job ${jobId} timed out (90s waiting for provider)`));
       }
     }, 90_000);
   });

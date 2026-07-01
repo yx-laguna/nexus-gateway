@@ -37,3 +37,11 @@ services:
       # ── Runtime ──────────────────────────────────────────────────────────────
       - key: NODE_ENV
         value: production
+
+  # Keep the web service warm — free tier spins down after 15min of inactivity
+  - type: cron
+    name: nexus-gateway-keepalive
+    runtime: node
+    buildCommand: echo ok
+    startCommand: curl -sf https://nexus-gateway-1.onrender.com/health
+    schedule: "*/5 * * * *"
