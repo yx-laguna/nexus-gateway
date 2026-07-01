@@ -70,11 +70,16 @@ export async function initAcp(): Promise<void> {
     const p = pending.get(session.jobId);
 
     switch (entry.event.type) {
-      case "budget.set":
-        await session.fund(AssetToken.usdc(0, session.chainId));
+      case "budget.set": {
+        const budgetEntry = entry as unknown as { event: { budget?: { amount?: string | number } } };
+        const budgetAmt = Number(budgetEntry.event?.budget?.amount ?? 0.01);
+        console.log(`[acp] budget.set job=${session.jobId} amount=${budgetAmt} — funding now`);
+        await session.fund(AssetToken.usdc(budgetAmt, session.chainId));
         return;
+      }
 
       case "job.submitted": {
+        console.log(`[acp] job.submitted received job=${session.jobId}`);
         try {
           const raw = (entry as unknown as { event: { deliverable: string } }).event.deliverable;
           const deliverable = JSON.parse(raw) as {
@@ -100,6 +105,7 @@ export async function initAcp(): Promise<void> {
         return;
 
       case "job.rejected":
+        console.log(`[acp] job.rejected job=${session.jobId}`);
         p?.reject(new Error("ACP job rejected by provider"));
         pending.delete(session.jobId);
         return;
