@@ -45,6 +45,8 @@ interface Pending {
 const pending = new Map<string, Pending>();
 let acpClient: Awaited<ReturnType<typeof AcpAgent.create>> | null = null;
 
+export function isAcpReady(): boolean { return acpClient !== null; }
+
 // ---------------------------------------------------------------------------
 // Init — call once at startup
 // ---------------------------------------------------------------------------

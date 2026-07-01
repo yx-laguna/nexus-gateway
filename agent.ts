@@ -22,10 +22,11 @@ import { chat, type ChatMessage } from "./broker.js";
 import {
   searchMerchants,
   getMerchantInfo,
+  mintLink,
   type MerchantInfo,
   type MintedLink,
 } from "./laguna.js";
-import { acpMintLink } from "./acp.js";
+import { acpMintLink, isAcpReady } from "./acp.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -301,12 +302,23 @@ async function runTools(
             continue;
           }
 
-          // Mint affiliate link via ACP agent
-          const link = await acpMintLink({
-            merchant_id: merchant.id,
-            geo: intent.geo,
-            caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
-          });
+          // Mint affiliate link — use ACP agent if ready, else direct Laguna
+          let link: MintedLink;
+          if (isAcpReady()) {
+            console.log(`[agent] minting ${merchant.id} via ACP`);
+            link = await acpMintLink({
+              merchant_id: merchant.id,
+              geo: intent.geo,
+              caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
+            });
+          } else {
+            console.log(`[agent] ACP not ready — minting ${merchant.id} directly via Laguna`);
+            link = await mintLink({
+              merchant_id: merchant.id,
+              geo: intent.geo ?? undefined,
+              wallet_address: walletAddress ?? undefined,
+            });
+          }
 
           if (!link?.shortlink) {
             console.warn(`[agent] ⚠️ ${merchant.id} mint returned no shortlink — trying next`);
