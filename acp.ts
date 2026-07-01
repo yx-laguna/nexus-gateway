@@ -134,6 +134,14 @@ async function _acpMintLink(params: {
   geo?: string | null;
   caller_tag?: string;
 }): Promise<MintedLink> {
+  // Wait for acpClient.start() to complete before making any calls
+  const waitStart = Date.now();
+  while (!acpStarted) {
+    if (Date.now() - waitStart > 60_000) throw new Error("[acp] timed out waiting for ACP client to start");
+    console.log("[acp] waiting for start()...");
+    await new Promise((r) => setTimeout(r, 2_000));
+  }
+
   const providerAddr = PROVIDER_ADDR();
   const agents = await acpClient!.browseAgents("Laguna Affiliate", { topK: 5 });
   const provider = agents.find(
