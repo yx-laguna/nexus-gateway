@@ -151,7 +151,8 @@ async function _acpMintLink(params: {
   );
   if (!provider) throw new Error(`[acp] Provider ${providerAddr} not found in registry`);
 
-  const offering = provider.offerings.find((o) => o.name === "mint-affiliate-link");
+  console.log(`[acp] provider offerings:`, provider.offerings.map((o) => o.name));
+  const offering = provider.offerings.find((o) => o.name === "mint_link");
   if (!offering) throw new Error("[acp] mint-affiliate-link offering not published");
 
   const requirement: Record<string, string> = {
