@@ -12,6 +12,8 @@
     "build": "echo 'build ok'"
   },
   "dependencies": {
+    "@account-kit/infra": "^4.0.0",
+    "@virtuals-protocol/acp-node-v2": "^0.0.4",
     "dotenv": "^16.4.5",
     "grammy": "^1.31.0",
     "openai": "^4.77.0",

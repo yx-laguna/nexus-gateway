@@ -22,10 +22,10 @@ import { chat, type ChatMessage } from "./broker.js";
 import {
   searchMerchants,
   getMerchantInfo,
-  mintLink,
   type MerchantInfo,
   type MintedLink,
 } from "./laguna.js";
+import { acpMintLink } from "./acp.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -301,22 +301,11 @@ async function runTools(
             continue;
           }
 
-          // No wallet → return info only (no link)
-          if (!walletAddress) {
-            mintedMerchants.add(merchant.id);
-            return {
-              label: cat.label,
-              recommendations: cat.recommendations,
-              info,
-              link: { shortlink: "", merchant_id: merchant.id },
-            } satisfies EnrichedCategory;
-          }
-
-          // Mint affiliate link
-          const link = await mintLink({
+          // Mint affiliate link via ACP agent
+          const link = await acpMintLink({
             merchant_id: merchant.id,
             geo: intent.geo,
-            wallet_address: walletAddress,
+            caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
           });
 
           if (!link?.shortlink) {
@@ -514,10 +503,10 @@ function buildReply(
     lines.push(`\n_Links curated for *${userCountry}*. Somewhere else? \`/setcountry\`_`);
   }
 
-  // Wallet nudge — only when no wallet set
+  // Dashboard nudge — links work for everyone; wallet only needed for /dashboard
   if (!hasWallet) {
     lines.push(
-      `\n💳 *Want to earn cashback on these?*\nSave your EVM wallet and I'll track your USDC:\n\`/setwallet 0xYourAddress\``
+      `\n📊 _Want to track your cashback activity? Save your wallet:_\n\`/setwallet 0xYourAddress\``
     );
   }
 

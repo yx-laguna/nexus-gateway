@@ -21,6 +21,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { Bot, GrammyError, HttpError, type Context } from "grammy";
 import { processMessage, clearHistory } from "./agent.js";
 import { getDashboard } from "./laguna.js";
+import { initAcp } from "./acp.js";
 
 // ---------------------------------------------------------------------------
 // Env check
@@ -469,6 +470,9 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
 server.listen(PORT, async () => {
   console.log(`[bot] HTTP server on port ${PORT}`);
+
+  // Start ACP client (for mint-affiliate-link calls via the provider agent)
+  await initAcp();
 
   if (!publicUrl) {
     // No public URL — fall back to long-polling (local dev)

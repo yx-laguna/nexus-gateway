@@ -1,0 +1,39 @@
+services:
+  - type: web              # "web" (not worker) so Render assigns a public HTTPS URL
+    name: nexus-gateway    # RENDER_EXTERNAL_URL is set automatically — bot.ts uses it for webhook
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm run start
+    healthCheckPath: /health
+    envVars:
+      # ── Telegram ─────────────────────────────────────────────────────────────
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # fill in Render dashboard
+
+      # Auto-generated webhook secret — prevents spoofed updates from reaching the bot
+      - key: WEBHOOK_SECRET
+        generateValue: true
+
+      # ── Virtuals Agent Compute ───────────────────────────────────────────────
+      - key: VIRTUALS_API_KEY
+        sync: false          # generate at app.virtuals.io → your agent → Compute
+
+      # ── ACP client identity (Privy embedded wallet) ──────────────────────────
+      - key: ACP_CLIENT_WALLET
+        sync: false          # EVM address of the Privy wallet
+      - key: PRIVY_WALLET_ID
+        sync: false          # wallet ID from Privy dashboard
+      - key: PRIVY_SIGNER_PRIVATE_KEY
+        sync: false          # private key of an authorised Key Quorum signer
+
+      # Wallet address of the running ACPLagunaTranslator provider
+      - key: ACP_PROVIDER_ADDRESS
+        sync: false
+
+      # ── Laguna MCP (search / info / dashboard — direct calls) ────────────────
+      - key: LAGUNA_MCP_URL
+        value: https://agents.laguna.network/mcp
+
+      # ── Runtime ──────────────────────────────────────────────────────────────
+      - key: NODE_ENV
+        value: production
