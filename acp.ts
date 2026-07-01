@@ -153,7 +153,10 @@ async function _acpMintLink(params: {
 
   console.log(`[acp] provider offerings:`, provider.offerings.map((o) => o.name));
   const offering = provider.offerings.find((o) => o.name === "mint_link");
-  if (!offering) throw new Error("[acp] mint-affiliate-link offering not published");
+  if (!offering) throw new Error("[acp] mint_link offering not published");
+
+  // Log full offering object to check requiredFunds, slaMinutes, etc.
+  console.log(`[acp] offering object:`, JSON.stringify(offering));
 
   const requirement: Record<string, string> = {
     merchant_id: params.merchant_id,
@@ -161,22 +164,43 @@ async function _acpMintLink(params: {
   if (params.geo) requirement.geo = params.geo.toUpperCase();
   if (params.caller_tag) requirement.caller_tag = params.caller_tag;
 
-  const jobId = await acpClient!.createJobFromOffering(
-    baseSepolia.id,
-    offering,
-    provider.walletAddress,
-    requirement,
-    { evaluatorAddress: await acpClient!.getAddress() },
-  );
+  let jobId!: bigint;
+  try {
+    // Omit evaluatorAddress → zero address = skip-evaluation mode (auto-completes on submit)
+    jobId = await acpClient!.createJobFromOffering(
+      baseSepolia.id,
+      offering,
+      provider.walletAddress,
+      requirement,
+    );
+  } catch (err) {
+    // Log full error chain so we can see HTTP status + URL
+    const details: Record<string, unknown> = {};
+    if (err instanceof Error) {
+      details.name = err.name;
+      details.message = err.message;
+      details.shortMessage = (err as Record<string, unknown>).shortMessage;
+      details.metaMessages = (err as Record<string, unknown>).metaMessages;
+      details.status = (err as Record<string, unknown>).status;
+      details.url = (err as Record<string, unknown>).url;
+      const cause = err.cause;
+      if (cause instanceof Error) {
+        details.cause = { name: cause.name, message: cause.message };
+      }
+    }
+    console.error(`[acp] createJobFromOffering FAILED:`, JSON.stringify(details, null, 2));
+    throw err;
+  }
 
-  console.log(`[acp] job ${jobId} created for merchant=${params.merchant_id} geo=${params.geo ?? "SG"}`);
+  const jobIdStr = jobId.toString();
+  console.log(`[acp] job ${jobIdStr} created for merchant=${params.merchant_id} geo=${params.geo ?? "SG"}`);
 
   return new Promise<MintedLink>((resolve, reject) => {
-    pending.set(jobId, { resolve, reject });
+    pending.set(jobIdStr, { resolve, reject });
     setTimeout(() => {
-      if (pending.has(jobId)) {
-        pending.delete(jobId);
-        reject(new Error(`[acp] Job ${jobId} timed out (90s waiting for provider)`));
+      if (pending.has(jobIdStr)) {
+        pending.delete(jobIdStr);
+        reject(new Error(`[acp] Job ${jobIdStr} timed out (90s waiting for provider)`));
       }
     }, 90_000);
   });
