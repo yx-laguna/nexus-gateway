@@ -16,7 +16,7 @@ import {
   SocketTransport,
 } from "@virtuals-protocol/acp-node-v2";
 import type { JobSession, JobRoomEntry } from "@virtuals-protocol/acp-node-v2";
-import { baseSepolia } from "@account-kit/infra";
+import { base } from "@account-kit/infra";
 import type { MintedLink } from "./laguna.js";
 
 // ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ export async function initAcp(): Promise<void> {
       walletAddress: CLIENT_WALLET(),
       walletId: CLIENT_PRIVY_ID(),
       signerPrivateKey: CLIENT_PRIVY_SIGNER(),
-      chains: [baseSepolia],
+      chains: [base],
     }),
   });
 
@@ -168,7 +168,7 @@ async function _acpMintLink(params: {
   try {
     // Omit evaluatorAddress → zero address = skip-evaluation mode (auto-completes on submit)
     jobId = await acpClient!.createJobFromOffering(
-      baseSepolia.id,
+      base.id,
       offering,
       provider.walletAddress,
       requirement,
