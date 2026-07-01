@@ -28,10 +28,10 @@ function requireEnv(k: string): string {
   return v;
 }
 
-const CLIENT_WALLET   = () => requireEnv("ACP_CLIENT_WALLET")          as `0x${string}`;
-const PRIVY_WALLET_ID = () => requireEnv("PRIVY_WALLET_ID");
-const PRIVY_SIGNER_PK = () => requireEnv("PRIVY_SIGNER_PRIVATE_KEY")   as `0x${string}`;
-const PROVIDER_ADDR   = () => requireEnv("ACP_PROVIDER_ADDRESS").toLowerCase();
+const CLIENT_WALLET       = () => requireEnv("ACP_CLIENT_WALLET")            as `0x${string}`;
+const CLIENT_PRIVY_ID     = () => requireEnv("ACP_CLIENT_PRIVY_WALLET_ID");
+const CLIENT_PRIVY_SIGNER = () => requireEnv("ACP_CLIENT_PRIVY_SIGNER_PK");
+const PROVIDER_ADDR       = () => requireEnv("ACP_PROVIDER_ADDRESS").toLowerCase();
 
 // ---------------------------------------------------------------------------
 // Pending job tracking
@@ -53,8 +53,8 @@ export async function initAcp(): Promise<void> {
   acpClient = await AcpAgent.create({
     provider: await PrivyAlchemyEvmProviderAdapter.create({
       walletAddress: CLIENT_WALLET(),
-      walletId: PRIVY_WALLET_ID(),
-      signerPrivateKey: PRIVY_SIGNER_PK(),
+      walletId: CLIENT_PRIVY_ID(),
+      signerPrivateKey: CLIENT_PRIVY_SIGNER(),
       chains: [baseSepolia],
     }),
   });

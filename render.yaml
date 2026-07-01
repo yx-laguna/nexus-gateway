@@ -18,13 +18,13 @@ services:
       - key: VIRTUALS_API_KEY
         sync: false          # generate at app.virtuals.io → your agent → Compute
 
-      # ── ACP client identity (Privy embedded wallet) ──────────────────────────
+      # ── ACP client identity (acp-tester agent — hires the Laguna ACP provider) ─
       - key: ACP_CLIENT_WALLET
-        sync: false          # EVM address of the Privy wallet
-      - key: PRIVY_WALLET_ID
-        sync: false          # wallet ID from Privy dashboard
-      - key: PRIVY_SIGNER_PRIVATE_KEY
-        sync: false          # private key of an authorised Key Quorum signer
+        sync: false          # acp-tester EVM address (0x114d...)
+      - key: ACP_CLIENT_PRIVY_WALLET_ID
+        sync: false          # acp-tester Privy wallet ID
+      - key: ACP_CLIENT_PRIVY_SIGNER_PK
+        sync: false          # acp-tester Privy signer private key
 
       # Wallet address of the running ACPLagunaTranslator provider
       - key: ACP_PROVIDER_ADDRESS
