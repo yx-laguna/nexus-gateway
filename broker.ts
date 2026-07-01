@@ -33,7 +33,7 @@ function getClient(): OpenAI {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const MODEL = "moonshotai/kimi-k2-0905";
+const MODEL = "moonshotai-kimi-k2-6";
 
 export async function chat(
   messages: ChatMessage[],
