@@ -100,9 +100,34 @@ export async function initAcp(): Promise<void> {
         return;
       }
 
-      case "job.completed":
+      case "job.completed": {
+        console.log(`[acp] job.completed received job=${session.jobId}`);
+        if (!p) { pending.delete(session.jobId); return; }
+        try {
+          // In skip-eval mode the job auto-completes without a client job.submitted.
+          // Fetch full history to find the submitted deliverable.
+          const transport = (acpClient as unknown as { transport: { getHistory: (chainId: number, jobId: string) => Promise<JobRoomEntry[]> } }).transport;
+          const history = await transport.getHistory(session.chainId, session.jobId);
+          console.log(`[acp] job.completed history entries: ${history.length}`);
+          const submitEntry = history.find(
+            (e) => e.kind === "system" && (e as unknown as { event: { type: string } }).event?.type === "job.submitted"
+          ) as unknown as { event: { deliverable: string } } | undefined;
+          if (!submitEntry) throw new Error("No job.submitted entry in history");
+          const deliverable = JSON.parse(submitEntry.event.deliverable) as {
+            payload?: { shortlink?: string; merchant_id?: string };
+            shortlink?: string;
+            merchant_id?: string;
+          };
+          const shortlink = deliverable?.payload?.shortlink ?? deliverable?.shortlink;
+          const merchant_id = deliverable?.payload?.merchant_id ?? deliverable?.merchant_id ?? "";
+          if (!shortlink) throw new Error("No shortlink in ACP deliverable");
+          p.resolve({ shortlink, merchant_id });
+        } catch (err) {
+          p.reject(err instanceof Error ? err : new Error(String(err)));
+        }
         pending.delete(session.jobId);
         return;
+      }
 
       case "job.rejected":
         console.log(`[acp] job.rejected job=${session.jobId}`);
