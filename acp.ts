@@ -44,6 +44,9 @@ interface Pending {
 }
 
 const pending = new Map<string, Pending>();
+// Store real JobSession objects from socket events so the polling fallback can fund jobs
+// even when the socket drops mid-flow (budget.set fires on socket, but then it drops).
+const sessionMap = new Map<string, JobSession>();
 let acpClient: Awaited<ReturnType<typeof AcpAgent.create>> | null = null;
 let acpStarted = false;
 
@@ -66,6 +69,9 @@ export async function initAcp(): Promise<void> {
   });
 
   acpClient.on("entry", async (session: JobSession, entry: JobRoomEntry) => {
+    // Always store the real session so polling fallback can call session.fund()
+    sessionMap.set(session.jobId, session);
+
     if (entry.kind !== "system") return;
     const p = pending.get(session.jobId);
 
@@ -267,23 +273,24 @@ async function _acpMintLink(params: {
           }
         }
 
-        // If budget.set found but not yet funded — fund it
+        // If budget.set found but not yet funded — fund it using the stored real session
         const budgetEntry = byType("budget.set");
         const fundedEntry = byType("job.funded");
         if (budgetEntry && !fundedEntry && !funded) {
-          funded = true;
-          console.log(`[acp] poll: budget.set in history for job ${jobIdStr} — funding (socket fallback)`);
-          try {
-            const agentAny = acpClient as unknown as { getOrCreateSession?: (id: string, chainId: number, entries: unknown[]) => { fund: (t: unknown) => Promise<void> } };
-            const session = agentAny.getOrCreateSession?.(jobIdStr, base.id, history);
+          const storedSession = sessionMap.get(jobIdStr);
+          if (!storedSession) {
+            console.log(`[acp] poll: budget.set for job ${jobIdStr} but no session yet — waiting for socket`);
+          } else {
+            funded = true;
             const amt = budgetEntry.event?.budget?.amount ?? 0.01;
-            if (session) {
-              await session.fund(AssetToken.usdc(Number(amt), base.id));
-              console.log(`[acp] poll: funded job ${jobIdStr} with ${amt} USDC`);
+            console.log(`[acp] poll: funding job ${jobIdStr} with ${amt} USDC via stored session`);
+            try {
+              await storedSession.fund(AssetToken.usdc(Number(amt), base.id));
+              console.log(`[acp] poll: funded job ${jobIdStr} ✅`);
+            } catch (fundErr) {
+              console.warn(`[acp] poll: fund failed for job ${jobIdStr}:`, fundErr instanceof Error ? fundErr.message : fundErr);
+              funded = false; // allow retry next tick
             }
-          } catch (fundErr) {
-            console.warn(`[acp] poll: fund failed for job ${jobIdStr}:`, fundErr instanceof Error ? fundErr.message : fundErr);
-            funded = false; // allow retry next tick
           }
         }
       } catch (pollErr) {
