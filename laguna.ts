@@ -65,8 +65,23 @@ export interface MintedLink {
   [key: string]: unknown;
 }
 
+export interface DashboardBalance {
+  pending_usdc: string;
+  available_usdc: string;
+  total_earned_usdc: string;
+  total_withdrawn_usdc: string;
+  total_fees_usdc: string;
+  note?: string;
+}
+
 export interface Dashboard {
-  balance?: number | string;
+  balance?: DashboardBalance | number | string;
+  summary?: {
+    total_links?: number;
+    total_clicks?: number;
+    total_conversions?: number;
+    conversion_rate?: number;
+  };
   conversions?: unknown[];
   analytics?: unknown;
   [key: string]: unknown;

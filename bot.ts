@@ -253,14 +253,33 @@ bot.command("dashboard", async (ctx: Context) => {
 
   const msg = await ctx.reply("Fetching your dashboard…");
   try {
-    const data = await getDashboard({ wallet_address: wallet, include: ["conversions", "analytics"] });
-    const balance = data.balance !== undefined ? `$${data.balance} USDC` : "N/A";
-    const conversions = Array.isArray(data.conversions) ? data.conversions.length : "N/A";
+    const data = await getDashboard({ wallet_address: wallet, include: ["conversions"] });
+
+    // balance is a nested object from the Laguna API
+    let availableStr = "N/A";
+    let pendingStr = "N/A";
+    let totalEarnedStr = "N/A";
+    const bal = data.balance;
+    if (bal && typeof bal === "object" && !Array.isArray(bal)) {
+      const b = bal as { available_usdc?: string; pending_usdc?: string; total_earned_usdc?: string };
+      availableStr = `$${b.available_usdc ?? "0"} USDC`;
+      pendingStr = `$${b.pending_usdc ?? "0"} USDC`;
+      totalEarnedStr = `$${b.total_earned_usdc ?? "0"} USDC`;
+    } else if (bal !== undefined) {
+      availableStr = `$${bal} USDC`;
+    }
+
+    const summary = data.summary as { total_conversions?: number } | undefined;
+    const conversions = Array.isArray(data.conversions)
+      ? data.conversions.length
+      : (summary?.total_conversions ?? "N/A");
 
     await ctx.api.editMessageText(
       ctx.chat!.id, msg.message_id,
       `📊 *Your Opi Dashboard*\n\n` +
-      `💰 Balance: *${balance}*\n` +
+      `💰 Available: *${availableStr}*\n` +
+      `⏳ Pending: *${pendingStr}*\n` +
+      `🏆 Total Earned: *${totalEarnedStr}*\n` +
       `🔗 Conversions: *${conversions}*\n\n` +
       `Wallet: \`${wallet}\`\n` +
       `_Payouts sent to your wallet_`,
