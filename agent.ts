@@ -308,6 +308,7 @@ async function runTools(
             merchant_id: merchant.id,
             geo: intent.geo,
             caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
+            wallet_address: walletAddress || undefined,
           });
 
           mintedMerchants.add(merchant.id);

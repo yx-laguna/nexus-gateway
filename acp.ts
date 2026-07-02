@@ -152,6 +152,7 @@ export async function acpMintLink(params: {
   merchant_id: string;
   geo?: string | null;
   caller_tag?: string;
+  wallet_address?: string;
 }): Promise<MintedLink> {
   if (!acpClient) throw new Error("[acp] ACP client not initialised — call initAcp() first");
 
@@ -166,6 +167,7 @@ async function _acpMintLink(params: {
   merchant_id: string;
   geo?: string | null;
   caller_tag?: string;
+  wallet_address?: string;
 }): Promise<MintedLink> {
   // Wait for acpClient.start() to complete before making any calls
   const waitStart = Date.now();
@@ -194,6 +196,7 @@ async function _acpMintLink(params: {
   };
   if (params.geo) requirement.geo = params.geo.toUpperCase();
   if (params.caller_tag) requirement.caller_tag = params.caller_tag;
+  if (params.wallet_address) requirement.wallet_address = params.wallet_address;
 
   let jobId!: bigint;
   try {
