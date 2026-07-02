@@ -298,7 +298,12 @@ export async function getMerchantInfo(params: {
   merchant_id: string;
   geo?: string;
 }): Promise<MerchantInfo> {
-  return callTool<MerchantInfo>("get_merchant_info", params as Record<string, unknown>);
+  const raw = await callTool<MerchantInfo | { merchant: MerchantInfo }>("get_merchant_info", params as Record<string, unknown>);
+  // API wraps response in { merchant: {...} } — unwrap it
+  if (raw && typeof raw === "object" && "merchant" in raw && typeof (raw as { merchant?: unknown }).merchant === "object") {
+    return (raw as { merchant: MerchantInfo }).merchant;
+  }
+  return raw as MerchantInfo;
 }
 
 export async function mintLink(params: {

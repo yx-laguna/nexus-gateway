@@ -536,29 +536,20 @@ function buildReply(
     });
 
     if (matched) {
-      const primaryName = matched.info?.name ?? cat.label;
+      const primaryName = matched.info?.name ?? matched.info?.id ?? cat.label;
       const primaryRate = extractRate(matched.info);
-      const rateStr = (r: ReturnType<typeof extractRate>) => r ? ` · ${(r.rate * 100).toFixed(0)}% rebate` : "";
+      const fmtRate = (r: ReturnType<typeof extractRate>) => r ? ` (${(r.rate * 100).toFixed(0)}% rebate)` : "";
 
-      // Build booking line(s) — primary platform
+      // Build one clean booking line
       if (matched.link?.shortlink) {
-        lines.push(`→ Book on *${primaryName}*${rateStr(primaryRate)}: ${matched.link.shortlink}`);
+        lines.push(`→ Book via *${primaryName}*${fmtRate(primaryRate)}: ${matched.link.shortlink}`);
       } else if (matched.acpJob) {
-        lines.push(`→ *${primaryName}*${rateStr(primaryRate)} — _link coming shortly_ ⏳`);
+        // Extra platforms inline (e.g. "also on Agoda")
+        const extras = (matched.extraPlatforms ?? []).map(ep => ep.name).join(" & ");
+        const alsoStr = extras ? ` (also on ${extras})` : "";
+        lines.push(`→ We recommend booking via *${primaryName}*${fmtRate(primaryRate)}${alsoStr} — _affiliate link coming shortly_ ⏳`);
       } else {
-        lines.push(`→ via *${primaryName}*${rateStr(primaryRate)}`);
-      }
-
-      // Extra platforms (hotel: agoda alongside trip-com)
-      if (matched.extraPlatforms) {
-        for (const ep of matched.extraPlatforms) {
-          const epRate = extractRate(ep.info);
-          if (ep.link?.shortlink) {
-            lines.push(`→ Book on *${ep.name}*${rateStr(epRate)}: ${ep.link.shortlink}`);
-          } else if (ep.acpJob) {
-            lines.push(`→ *${ep.name}*${rateStr(epRate)} — _link coming shortly_ ⏳`);
-          }
-        }
+        lines.push(`→ via *${primaryName}*${fmtRate(primaryRate)}`);
       }
 
       // Cashback calc on primary
@@ -714,22 +705,37 @@ async function _processMessage(
 
       // For each ACP job in flight, send follow-up when it settles
       if (onFollowUp) {
-        const sendFollowUp = (job: Promise<MintedLink>, name: string, info: MerchantInfo) => {
-          job.then((minted) => {
-            console.log(`[acp] ✅ follow-up link ready for ${name}:`, minted.shortlink);
-            const rateInfo = extractRate(info);
-            const rateStr = rateInfo ? ` · earn *${(rateInfo.rate * 100).toFixed(0)}% rebate*` : "";
-            return onFollowUp(`🔗 *${name}*${rateStr}\n${minted.shortlink}`);
-          }).catch((err) => {
-            console.error(`[acp] follow-up failed for ${name}:`, err instanceof Error ? err.message : err);
-          });
-        };
-
         for (const cat of enriched) {
-          if (cat.acpJob) sendFollowUp(cat.acpJob, cat.info?.name ?? cat.label, cat.info);
-          for (const ep of cat.extraPlatforms ?? []) {
-            if (ep.acpJob) sendFollowUp(ep.acpJob, ep.name, ep.info);
-          }
+          const primaryName = cat.info?.name ?? cat.info?.id ?? cat.label;
+          const primaryRate = extractRate(cat.info);
+          const rateStr = primaryRate ? ` · *${(primaryRate.rate * 100).toFixed(0)}% rebate*` : "";
+
+          // If there are extra platforms (agoda + trip), bundle all links into one message
+          const extraJobs = (cat.extraPlatforms ?? []).filter(ep => ep.acpJob);
+          const allJobs = [
+            ...(cat.acpJob ? [{ name: primaryName, job: cat.acpJob, info: cat.info }] : []),
+            ...extraJobs.map(ep => ({ name: ep.name, job: ep.acpJob!, info: ep.info })),
+          ];
+
+          if (allJobs.length === 0) continue;
+
+          // Wait for all platform links then send one combined message
+          Promise.allSettled(allJobs.map(j => j.job)).then((results) => {
+            const linkLines: string[] = [];
+            results.forEach((r, i) => {
+              const { name, info } = allJobs[i];
+              const rate = extractRate(info);
+              const rs = rate ? ` · ${(rate.rate * 100).toFixed(0)}% rebate` : "";
+              if (r.status === "fulfilled") {
+                linkLines.push(`🔗 *${name}*${rs}\n${r.value.shortlink}`);
+              }
+            });
+            if (linkLines.length > 0) {
+              return onFollowUp(linkLines.join("\n\n"));
+            }
+          }).catch((err) => {
+            console.error(`[acp] follow-up failed for ${primaryName}:`, err instanceof Error ? err.message : err);
+          });
         }
       }
 
