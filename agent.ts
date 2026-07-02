@@ -214,12 +214,23 @@ Max 4 categories. Output JSON only.`,
 // Step 2 — Parallel merchant search + link minting
 // ---------------------------------------------------------------------------
 
+export interface PlatformJob {
+  name: string;
+  merchantId: string;
+  info: MerchantInfo;
+  link: MintedLink | null;
+  acpJob?: Promise<MintedLink>;
+}
+
 export interface EnrichedCategory {
   label: string;
   recommendations: string[];
+  // Primary platform
   info: MerchantInfo;
-  link: MintedLink | null;       // null = ACP job in flight
-  acpJob?: Promise<MintedLink>;  // resolves when ACP settles
+  link: MintedLink | null;
+  acpJob?: Promise<MintedLink>;
+  // Extra platforms minted in parallel (e.g. agoda alongside trip-com for hotels)
+  extraPlatforms?: PlatformJob[];
 }
 
 async function runTools(
@@ -282,6 +293,26 @@ async function runTools(
     return list;
   }
 
+  const HOTEL_RE = /hotel|stay|accommodation|resort|hostel/i;
+
+  function mintJob(merchantId: string, geo: string | null | undefined): Promise<MintedLink> {
+    return acpMintLink({
+      merchant_id: merchantId,
+      geo,
+      caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
+      wallet_address: walletAddress || undefined,
+    });
+  }
+
+  async function resolveMerchant(platformSlug: string, geo: string | null | undefined): Promise<{ id: string; info: MerchantInfo } | null> {
+    const merchants = await searchMerchants({ query: platformSlug, geo, limit: 3, sort: "relevance" });
+    for (const m of merchants) {
+      const info = await getMerchantInfo({ merchant_id: m.id, geo });
+      if (info && (info as { available?: boolean }).available !== false) return { id: m.id, info };
+    }
+    return null;
+  }
+
   // Deduplicate minted merchants across categories
   const mintedMerchants = new Set<string>();
 
@@ -289,10 +320,49 @@ async function runTools(
   const categoryResults = await Promise.allSettled(
     intent.categories.map(async (cat) => {
       const platforms = platformsForCategory(cat.label, cat.platform_search);
-      console.log(`[agent] category "${cat.label}" — trying platforms:`, platforms);
+      const isHotel = HOTEL_RE.test(cat.label);
+      console.log(`[agent] category "${cat.label}" isHotel=${isHotel} — trying platforms:`, platforms);
 
+      // For hotels: always mint BOTH trip-com and agoda in parallel
+      if (isHotel) {
+        const [tripResult, agodaResult] = await Promise.allSettled([
+          resolveMerchant("trip-com", intent.geo),
+          resolveMerchant("agoda", intent.geo),
+        ]);
+
+        const trip = tripResult.status === "fulfilled" ? tripResult.value : null;
+        const agoda = agodaResult.status === "fulfilled" ? agodaResult.value : null;
+
+        if (!trip && !agoda) throw new Error(`No hotel merchants available for ${cat.label}`);
+
+        // Primary = trip-com, extra = agoda (or swap if trip-com failed)
+        const primary = trip ?? agoda!;
+        const extra = trip && agoda ? agoda : null;
+
+        mintedMerchants.add(primary.id);
+        const primaryJob = mintJob(primary.id, intent.geo);
+        console.log(`[agent] hotel: firing ACP for primary=${primary.id}`);
+
+        let extraPlatforms: PlatformJob[] | undefined;
+        if (extra) {
+          mintedMerchants.add(extra.id);
+          const extraJob = mintJob(extra.id, intent.geo);
+          console.log(`[agent] hotel: firing ACP for extra=${extra.id}`);
+          extraPlatforms = [{ name: extra.info.name ?? extra.id, merchantId: extra.id, info: extra.info, link: null, acpJob: extraJob }];
+        }
+
+        return {
+          label: cat.label,
+          recommendations: cat.recommendations,
+          info: primary.info,
+          link: null,
+          acpJob: primaryJob,
+          extraPlatforms,
+        } satisfies EnrichedCategory;
+      }
+
+      // Non-hotel: find first available merchant and optionally mint
       for (const platform of platforms) {
-        // Search Laguna for this platform
         const merchants = await searchMerchants({
           query: platform,
           geo: intent.geo,
@@ -307,11 +377,9 @@ async function runTools(
 
         console.log(`[agent] "${platform}" → ${merchants.length} result(s):`, merchants.map((m) => m.id));
 
-        // Try each merchant returned for this platform
         for (const merchant of merchants) {
           if (mintedMerchants.has(merchant.id)) continue;
 
-          // Check availability
           const info = await getMerchantInfo({ merchant_id: merchant.id, geo: intent.geo });
           if (!info || (info as { available?: boolean }).available === false) {
             console.warn(`[agent] ⚠️ ${merchant.id} not available — trying next`);
@@ -321,20 +389,12 @@ async function runTools(
           mintedMerchants.add(merchant.id);
 
           if (!mintLinks) {
-            // Browsing mode — return merchant info only, no ACP job
             console.log(`[agent] browsing mode, skipping ACP for ${merchant.id}`);
             return { label: cat.label, recommendations: cat.recommendations, info, link: null } satisfies EnrichedCategory;
           }
 
-          // Fire ACP job — non-blocking, link delivered via follow-up message
           console.log(`[agent] firing ACP job for ${merchant.id}`);
-          const acpJob = acpMintLink({
-            merchant_id: merchant.id,
-            geo: intent.geo,
-            caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
-            wallet_address: walletAddress || undefined,
-          });
-
+          const acpJob = mintJob(merchant.id, intent.geo);
           console.log(`[agent] ✅ ACP job started for "${cat.label}" (${merchant.id})`);
           return { label: cat.label, recommendations: cat.recommendations, info, link: null, acpJob } satisfies EnrichedCategory;
         }
@@ -475,37 +535,43 @@ function buildReply(
       lines.push(`${i + 1}. ${rec}`);
     });
 
-    if (matched?.link?.shortlink) {
-      const name = matched.info?.name ?? cat.platform_search;
-      lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
+    if (matched) {
+      const primaryName = matched.info?.name ?? cat.label;
+      const primaryRate = extractRate(matched.info);
+      const rateStr = (r: ReturnType<typeof extractRate>) => r ? ` · ${(r.rate * 100).toFixed(0)}% rebate` : "";
 
-      const rateInfo = extractRate(matched.info);
-      const pick = recs[0] ?? "";
-      if (rateInfo) {
-        const price = extractPrice(pick);
-        if (price) {
-          const cashback = price * rateInfo.rate;
-          totalCashback += cashback;
-          if (rateInfo.isEstimate) anyEstimate = true;
-          cashbackBreakdown.push(
-            `${name} ${(rateInfo.rate * 100).toFixed(0)}% × $${price} = $${cashback.toFixed(2)}`
-          );
+      // Build booking line(s) — primary platform
+      if (matched.link?.shortlink) {
+        lines.push(`→ Book on *${primaryName}*${rateStr(primaryRate)}: ${matched.link.shortlink}`);
+      } else if (matched.acpJob) {
+        lines.push(`→ *${primaryName}*${rateStr(primaryRate)} — _link coming shortly_ ⏳`);
+      } else {
+        lines.push(`→ via *${primaryName}*${rateStr(primaryRate)}`);
+      }
+
+      // Extra platforms (hotel: agoda alongside trip-com)
+      if (matched.extraPlatforms) {
+        for (const ep of matched.extraPlatforms) {
+          const epRate = extractRate(ep.info);
+          if (ep.link?.shortlink) {
+            lines.push(`→ Book on *${ep.name}*${rateStr(epRate)}: ${ep.link.shortlink}`);
+          } else if (ep.acpJob) {
+            lines.push(`→ *${ep.name}*${rateStr(epRate)} — _link coming shortly_ ⏳`);
+          }
         }
       }
-    } else if (matched?.acpJob) {
-      const name = matched.info?.name ?? cat.platform_search;
-      const rateInfo = extractRate(matched.info);
-      const rateStr = rateInfo ? ` · ${(rateInfo.rate * 100).toFixed(0)}% rebate` : "";
-      lines.push(`→ via *${name}*${rateStr} — _sending your link shortly!_ ⏳`);
-    } else if (!purchaseReady && matched) {
-      // Browsing mode — just show the platform, don't mention links
-      const name = matched.info?.name ?? cat.platform_search;
-      const rateInfo = extractRate(matched.info);
-      const rateStr = rateInfo ? ` (${(rateInfo.rate * 100).toFixed(0)}% rebate available)` : "";
-      lines.push(`→ Available on ${name}${rateStr}`);
-    } else if (matched) {
-      const name = matched.info?.name ?? cat.platform_search;
-      lines.push(`→ via ${name}`);
+
+      // Cashback calc on primary
+      if (primaryRate) {
+        const pick = recs[0] ?? "";
+        const price = extractPrice(pick);
+        if (price) {
+          const cashback = price * primaryRate.rate;
+          totalCashback += cashback;
+          if (primaryRate.isEstimate) anyEstimate = true;
+          cashbackBreakdown.push(`${primaryName} ${(primaryRate.rate * 100).toFixed(0)}% × $${price} = $${cashback.toFixed(2)}`);
+        }
+      }
     } else {
       lines.push(`→ via ${cat.platform_search}`);
     }
@@ -648,20 +714,22 @@ async function _processMessage(
 
       // For each ACP job in flight, send follow-up when it settles
       if (onFollowUp) {
-        for (const cat of enriched) {
-          if (!cat.acpJob) continue;
-          const merchantName = cat.info?.name ?? cat.label;
-          cat.acpJob.then((minted) => {
-            console.log(`[acp] ✅ follow-up link ready for ${merchantName}:`, minted.shortlink);
-            const rateInfo = extractRate(cat.info);
-            const rateStr = rateInfo ? ` · earn *${(rateInfo.rate * 100).toFixed(0)}% cashback*` : "";
-            return onFollowUp(
-              `🔗 *Your ${merchantName} affiliate link is ready!*${rateStr}\n\n${minted.shortlink}\n\n_via Laguna ACP agent_ ✅`
-            );
+        const sendFollowUp = (job: Promise<MintedLink>, name: string, info: MerchantInfo) => {
+          job.then((minted) => {
+            console.log(`[acp] ✅ follow-up link ready for ${name}:`, minted.shortlink);
+            const rateInfo = extractRate(info);
+            const rateStr = rateInfo ? ` · earn *${(rateInfo.rate * 100).toFixed(0)}% rebate*` : "";
+            return onFollowUp(`🔗 *${name}*${rateStr}\n${minted.shortlink}`);
           }).catch((err) => {
-            console.error(`[acp] follow-up failed for ${merchantName}:`, err instanceof Error ? err.message : err);
-            onFollowUp(`⚠️ Couldn't mint the ${merchantName} link via ACP: ${err instanceof Error ? err.message : err}`).catch(() => {});
+            console.error(`[acp] follow-up failed for ${name}:`, err instanceof Error ? err.message : err);
           });
+        };
+
+        for (const cat of enriched) {
+          if (cat.acpJob) sendFollowUp(cat.acpJob, cat.info?.name ?? cat.label, cat.info);
+          for (const ep of cat.extraPlatforms ?? []) {
+            if (ep.acpJob) sendFollowUp(ep.acpJob, ep.name, ep.info);
+          }
         }
       }
 

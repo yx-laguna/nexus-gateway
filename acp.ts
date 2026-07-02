@@ -302,8 +302,8 @@ async function _acpMintLink(params: {
       if (pending.has(jobIdStr)) {
         clearInterval(pollInterval);
         pending.delete(jobIdStr);
-        reject(new Error(`[acp] Job ${jobIdStr} timed out (90s waiting for provider)`));
+        reject(new Error(`[acp] Job ${jobIdStr} timed out (5min waiting for provider)`));
       }
-    }, 90_000);
+    }, 300_000);
   });
 }
