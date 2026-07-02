@@ -298,10 +298,13 @@ export async function getMerchantInfo(params: {
   merchant_id: string;
   geo?: string;
 }): Promise<MerchantInfo> {
-  const raw = await callTool<MerchantInfo | { merchant: MerchantInfo }>("get_merchant_info", params as Record<string, unknown>);
-  // API wraps response in { merchant: {...} } — unwrap it
-  if (raw && typeof raw === "object" && "merchant" in raw && typeof (raw as { merchant?: unknown }).merchant === "object") {
-    return (raw as { merchant: MerchantInfo }).merchant;
+  const raw = await callTool<Record<string, unknown>>("get_merchant_info", params as Record<string, unknown>);
+  // API returns { merchant: {...}, cashback: {...}, available: bool }
+  // Unwrap by merging merchant fields with root-level cashback/available
+  if (raw && typeof raw === "object" && "merchant" in raw && raw.merchant && typeof raw.merchant === "object") {
+    const { merchant, ...rootFields } = raw;
+    // merchant has id/name/etc; rootFields has cashback + available
+    return { ...(merchant as MerchantInfo), ...rootFields } as MerchantInfo;
   }
   return raw as MerchantInfo;
 }

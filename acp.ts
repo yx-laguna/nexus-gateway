@@ -279,7 +279,23 @@ async function _acpMintLink(params: {
         if (budgetEntry && !fundedEntry && !funded) {
           const storedSession = sessionMap.get(jobIdStr);
           if (!storedSession) {
-            console.log(`[acp] poll: budget.set for job ${jobIdStr} but no session yet — waiting for socket`);
+            // Socket dropped and never delivered session via on("entry").
+            // Call hydrateSessions() to force-load sessions from the API — this will
+            // trigger on("entry") callbacks which populate sessionMap and fund the job.
+            console.log(`[acp] poll: budget.set for job ${jobIdStr} but no session — calling hydrateSessions`);
+            try {
+              const agentAny = acpClient as unknown as { hydrateSessions?: () => Promise<void> };
+              if (agentAny.hydrateSessions) {
+                await agentAny.hydrateSessions();
+                console.log(`[acp] poll: hydrateSessions called — on("entry") callbacks should fund job ${jobIdStr}`);
+              } else {
+                console.warn(`[acp] poll: hydrateSessions not available on acpClient`);
+              }
+            } catch (hydrateErr) {
+              console.warn(`[acp] poll: hydrateSessions error for job ${jobIdStr}:`, hydrateErr instanceof Error ? hydrateErr.message : hydrateErr);
+            }
+            // If on("entry") funded synchronously, mark funded so we don't double-fund
+            if (sessionMap.has(jobIdStr)) funded = true;
           } else {
             funded = true;
             const amt = budgetEntry.event?.budget?.amount ?? 0.01;
