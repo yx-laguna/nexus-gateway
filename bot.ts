@@ -117,10 +117,9 @@ bot.command("start", async (ctx: Context) => {
   // Returning user with full profile — skip onboarding
   if (profile.onboarding === "complete" && profile.country && profile.wallet) {
     await ctx.reply(
-      `👋 Welcome back! Here's your profile:\n\n` +
-      `🌍 Country: *${profile.country}*\n` +
-      `💳 Wallet: \`${profile.wallet}\`\n\n` +
-      `Just tell me what you're looking for and I'll find the best deals!`,
+      `👋 Hey ${firstName}, welcome back!\n\n` +
+      `🌍 *${profile.country}* · 💳 \`${profile.wallet}\`\n\n` +
+      `Tell me your next shopping list or trip — I'll find the best rebate for you.`,
       { parse_mode: "Markdown" }
     );
     return;
@@ -129,10 +128,9 @@ bot.command("start", async (ctx: Context) => {
   // New user — start onboarding
   updateProfile(userId, { onboarding: "awaiting_country" });
   await ctx.reply(
-    `👋 Hey ${firstName}! I'm *Opi* — your personal travel & shopping assistant.\n\n` +
-    `I find the best deals on flights, hotels, and shopping — and pass the cashback *directly to your crypto wallet*.\n\n` +
-    `Let's get you set up! First — *where are you shopping and booking from?*\n\n` +
-    `Just reply with your country, e.g:\n_Singapore_, _Hong Kong_, _United States_`,
+    `👋 Hey ${firstName}! I'm *Varius*, your AI-assisted deals expert powered by Virtuals Protocol & Laguna Network.\n\n` +
+    `Tell me your next shopping list or trip — I'll find the best rebate for you.\n\n` +
+    `First — *where are you shopping and booking from?*\n_(e.g. Singapore, Hong Kong, United States)_`,
     { parse_mode: "Markdown" }
   );
 });
@@ -337,9 +335,9 @@ bot.on("message:text", async (ctx: Context) => {
     if (!code) {
       // Nothing parseable — show onboarding prompt
       await ctx.reply(
-        `👋 Hey! I'm *Opi* — before we dive in I need two quick things:\n\n` +
+        `👋 Hey! I'm *Varius*, your AI-assisted deals expert. Before we dive in, I need two quick things:\n\n` +
         `🌍 *Where are you shopping from?*\n_(e.g. Singapore, Hong Kong, United States)_\n\n` +
-        `💳 *Your EVM wallet address* to receive cashback\n_(e.g. \`0xAbCd…1234\`)_\n\n` +
+        `💳 *Your EVM wallet address* to receive rebates\n_(e.g. \`0xAbCd…1234\`)_\n\n` +
         `You can send both in one message!`,
         { parse_mode: "Markdown" }
       );
@@ -388,11 +386,6 @@ bot.on("message:text", async (ctx: Context) => {
   // ── Fully onboarded — pass to agent ─────────────────────────────────────
   // Only show the waiting message for shopping/travel queries that hit the
   // full LLM + Laguna pipeline. Short casual messages respond in <2s.
-  const SHOPPING_KEYWORDS = /hotel|flight|book|buy|shop|trip|travel|plan|stay|find|search|recommend|cheapest|best|vitamin|supplement|shoe|shirt|bag|watch|phone|laptop|ticket|tour|activity|nike|klook|shein|temu|crocs|puma|iherb|fashion|apparel|deal|price|cheap|affordable/i;
-  const isSlowQuery = text.trim().split(/\s+/).length > 3 || SHOPPING_KEYWORDS.test(text);
-  if (isSlowQuery) {
-    await ctx.reply("⏳ On it! Finding the best options and minting your affiliate link via ACP — I'll send the link separately once it's confirmed.");
-  }
   await ctx.replyWithChatAction("typing");
   try {
     const chatId = ctx.chat!.id;

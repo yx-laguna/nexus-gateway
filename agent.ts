@@ -38,32 +38,34 @@ const sessions = new Map<number, ChatMessage[]>();
 // System prompt — concierge-first, USDC as a footnote
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are Opi, a friendly travel and shopping concierge on Telegram.
+const SYSTEM_PROMPT = `You are Varius, an AI-assisted deals expert on Telegram powered by Virtuals Protocol & Laguna Network.
 
-## Your job in conversation
-- Chat naturally. Help the user figure out what they want.
-- ONE question at a time. Never interrogate.
-- Travel: you need destination + rough dates before acting.
-- Shopping: you need the item/category. Budget is nice but optional — if they give a budget, USE it, do NOT ask again.
-- If the user already told you the item, budget, or destination — act immediately. Do NOT re-ask for info already given.
-- Only ask a clarifying question if you genuinely cannot search at all without it.
+## Your personality
+Conversational, warm, knowledgeable — like a friend who knows all the best deals. Never robotic, never salesy. Don't push links or purchases until the user is clearly ready.
 
-## What you NEVER do in conversation
-- NEVER produce URLs, links, or platform names with addresses.
-- NEVER mention cashback rates — you don't have live data in conversation mode.
-- NEVER say "I'll send you a tracked link" or ask for a wallet address — the system handles that.
-- NEVER list platforms (Trip.com, Booking.com, Klook etc.) with prices or rates you made up.
+## How to handle conversations
+- Explore naturally. Ask about plans, preferences, vibe — ONE question at a time.
+- Travel: destination is enough to get started. Dates are nice but don't block you.
+- Shopping: item/category is enough. Budget optional.
+- If the user gave you info already — use it, don't ask again.
+- Don't mention rebates or links until the user shows clear purchase intent.
 
-## When the goal IS clear
-- Confirm the goal in one friendly sentence.
-- Say "Let me find the best options for you!" and stop — the system will fetch real merchant links automatically.
-- Do NOT list hotels, flights, or products yourself — the system does that with real data.
+## Purchase intent signals (system will then send links)
+Examples: "I'll go with...", "book this", "I want to buy", "send me the link", "which one should I get"
+
+## When there's no purchase intent yet
+- Present options warmly, ask what resonates, offer to dig deeper.
+- Do NOT say "I'll send a link" or mention cashback/ACP mechanics.
+
+## What you NEVER do
+- NEVER produce URLs or made-up prices.
+- NEVER mention "affiliate link", "cashback", or "rebate" during casual exploration.
 
 ## Off-topic
-"I'm best at travel and shopping — what are you planning?"
+"I'm best at travel and shopping — what are you planning next?"
 
 ## Tone
-Warm, concise, like a knowledgeable friend. Max 3 sentences in conversation mode.`;
+Friendly, concise. Max 3 sentences in casual conversation mode.`;
 
 
 
@@ -106,6 +108,11 @@ const GoalIntentSchema = z.object({
   clarification_question: z.string().nullish(),
   is_dashboard_query: z.boolean().default(false),
   is_off_topic: z.boolean().default(false),
+  /**
+   * true = user has expressed explicit purchase intent ("book this", "I'll get it", "send the link")
+   * false = user is browsing/exploring — show options but don't mint links yet
+   */
+  purchase_ready: z.boolean().default(false),
 });
 
 type GoalIntent = z.infer<typeof GoalIntentSchema>;
@@ -120,17 +127,21 @@ async function extractIntent(
   const prompt: ChatMessage[] = [
     {
       role: "system",
-      content: `You are an intent detection and goal-decomposition engine for a travel and retail concierge.
+      content: `You are an intent detection and goal-decomposition engine for a travel and retail deals assistant.
 
 ## Intent detection (pick ONE)
-- "travel_booking": user wants to book flights, hotels, car rentals, activities, or plan a trip. Triggers: "book", "fly to", "stay in", "hotel in", "trip to", "visit", "vacation", "holiday", destination names.
-- "retail_shopping": user wants to buy a product. Triggers: "buy", "shop for", "get me", "looking for" + item.
-- "product_comparison": user is comparing options. Triggers: "compare", "which is better", "vs", "difference between".
-- "general_question": travel or shopping question with no purchase intent. Answer conversationally — set categories to [].
-- "dashboard": user asks about their earnings, cashback, commissions. Set is_dashboard_query: true.
+- "travel_booking": user wants to book flights, hotels, car rentals, activities, or plan a trip.
+- "retail_shopping": user wants to buy a product.
+- "product_comparison": user is comparing options.
+- "general_question": travel or shopping question with no purchase intent — set categories to [].
+- "dashboard": user asks about earnings, cashback, commissions. Set is_dashboard_query: true.
 - "off_topic": nothing to do with travel or shopping. Set is_off_topic: true.
 
-If multiple intents, choose the most explicit one. If unclear, treat as "general_question".
+## purchase_ready detection
+Set purchase_ready: true ONLY if the user explicitly signals they want to proceed NOW:
+- "book this", "I'll go with", "I want to buy", "send me the link", "get me the link", "which one should I get", "how do I book", "let's do it", "I'm ready"
+- Asking to compare two specific named options also counts (they're close to deciding)
+Set purchase_ready: false if they're still exploring, asking "what's good", or haven't picked anything.
 
 ## Output — ONLY valid JSON, no explanation:
 {
@@ -138,27 +149,29 @@ If multiple intents, choose the most explicit one. If unclear, treat as "general
   "intent": "travel_booking" | "retail_shopping" | "product_comparison" | "general_question" | "dashboard" | "off_topic",
   "categories": [
     {
-      "label": string,              // e.g. "Flights", "Hotels", "Running Shoes", "Supplements"
-      "recommendations": [string],  // 2–3 SPECIFIC items with real names + price hints
-      "platform_search": string     // exact platform slug from the verified list below
+      "label": string,
+      "recommendations": [string],  // EXACTLY 3 items — see format rules below
+      "platform_search": string
     }
   ],
-  "geo": string|null,               // ISO 3166-1 alpha-2 if a country/region is mentioned
-  "needs_clarification": bool,      // true ONLY if you genuinely cannot produce categories without more info. If the user already stated product type, budget, or destination — set false and search immediately. NEVER ask for info the user already gave.
-  "clarification_question": string, // ONE short question only if needs_clarification is true
+  "geo": string|null,
+  "needs_clarification": bool,
+  "clarification_question": string|null,
   "is_dashboard_query": bool,
-  "is_off_topic": bool
+  "is_off_topic": bool,
+  "purchase_ready": bool
 }
 
-## Recommendation rules — be SPECIFIC:
-- Hotels: real property names + neighbourhood + price, e.g. "Pullman Jakarta Central Park, Thamrin (~$120/night)"
-- Flights: airline + route, e.g. "Garuda Indonesia CGK→NBO (from ~$650 return)"
-- Activities: named tours + platform, e.g. "Bali Swing & Ubud Tour via Klook (~$35)"
-- Running shoes: model names, e.g. "Nike Pegasus 41", "Adidas Ultraboost 24"
-- Supplements: brand + product, e.g. "Optimum Nutrition Gold Standard Whey"
-- Fashion: brand + item, e.g. "Uniqlo AIRism T-shirt", "Levi's 511 slim jeans"
+## Recommendation format — ALWAYS give exactly 3, be specific and add context:
+- Hotels: "Property name — neighbourhood context (e.g. 5-min walk to MRT / near beach / next to shopping strip) · ~$X/night"
+  e.g. "Marriott Tang Plaza — right on Orchard Road, connected to Tang Plaza mall · ~$280/night"
+- Flights: "Airline ORIGIN→DEST — timing note (e.g. departs 07:30, morning arrival, full day ahead) · from ~$X return"
+  e.g. "Scoot SIN→BKK — departs 08:10, arrives 09:45 local time, full day in Bangkok · from ~$90 return"
+- Activities: "Tour/activity name — location note · ~$X via Platform"
+- Products: "Brand + model — one-line value prop · ~$X"
+  e.g. "Nike Air Zoom Pegasus 41 — versatile daily trainer, wide size range · ~$130"
 
-## Platform search slugs (use EXACTLY these verified slugs):
+## Platform search slugs (use EXACTLY these):
 - Flights → "trip-com"
 - Hotels → "trip-com" or "agoda" or "ihg-amea"
 - Activities/Tours → "klook-pnr" or "kkday"
@@ -209,7 +222,8 @@ export interface EnrichedCategory {
 
 async function runTools(
   intent: GoalIntent,
-  walletAddress: string
+  walletAddress: string,
+  mintLinks: boolean = true
 ): Promise<EnrichedCategory[]> {
   // For each category label, an ordered list of Laguna merchant slugs to try.
   // Slugs verified against live Laguna merchant list (search_merchants).
@@ -302,6 +316,14 @@ async function runTools(
             continue;
           }
 
+          mintedMerchants.add(merchant.id);
+
+          if (!mintLinks) {
+            // Browsing mode — return merchant info only, no ACP job
+            console.log(`[agent] browsing mode, skipping ACP for ${merchant.id}`);
+            return { label: cat.label, recommendations: cat.recommendations, info, link: null } satisfies EnrichedCategory;
+          }
+
           // Fire ACP job — non-blocking, link delivered via follow-up message
           console.log(`[agent] firing ACP job for ${merchant.id}`);
           const acpJob = acpMintLink({
@@ -311,7 +333,6 @@ async function runTools(
             wallet_address: walletAddress || undefined,
           });
 
-          mintedMerchants.add(merchant.id);
           console.log(`[agent] ✅ ACP job started for "${cat.label}" (${merchant.id})`);
           return { label: cat.label, recommendations: cat.recommendations, info, link: null, acpJob } satisfies EnrichedCategory;
         }
@@ -424,32 +445,40 @@ function buildReply(
   intent: GoalIntent,
   enriched: EnrichedCategory[],
   hasWallet: boolean,
-  userCountry?: string
+  userCountry?: string,
+  purchaseReady: boolean = false
 ): string {
   const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
   const lines: string[] = [];
 
-  // Opening confirm line
-  lines.push(`On it — here's your plan for *${intent.goal}*.\n`);
+  if (purchaseReady) {
+    lines.push(`Great choice! Here's what I found for *${intent.goal}*.\n`);
+  } else {
+    lines.push(`Here are some options for *${intent.goal}*!\n`);
+  }
 
-  // One block per category + accumulate cashback estimate
   let totalCashback = 0;
   let anyEstimate = false;
   const cashbackBreakdown: string[] = [];
 
   for (const cat of intent.categories.slice(0, 4)) {
     const emoji = emojiFor(cat.label);
-    const pick = cat.recommendations[0] ?? cat.label;
     const matched = enrichedByLabel.get(cat.label);
 
-    lines.push(`${emoji} *${cat.label}* — ${pick}`);
+    lines.push(`${emoji} *${cat.label}*`);
+
+    // Show all 3 recommendations as a numbered list
+    const recs = cat.recommendations.slice(0, 3);
+    recs.forEach((rec, i) => {
+      lines.push(`${i + 1}. ${rec}`);
+    });
 
     if (matched?.link?.shortlink) {
       const name = matched.info?.name ?? cat.platform_search;
       lines.push(`→ Book on ${name}: ${matched.link.shortlink}`);
 
-      // Cashback math: rate × price extracted from recommendation string
       const rateInfo = extractRate(matched.info);
+      const pick = recs[0] ?? "";
       if (rateInfo) {
         const price = extractPrice(pick);
         if (price) {
@@ -462,55 +491,59 @@ function buildReply(
         }
       }
     } else if (matched?.acpJob) {
-      // ACP job in flight — link arriving separately
       const name = matched.info?.name ?? cat.platform_search;
       const rateInfo = extractRate(matched.info);
-      const rateStr = rateInfo ? ` · ${(rateInfo.rate * 100).toFixed(0)}% cashback` : "";
-      lines.push(`→ via *${name}*${rateStr}\n_⏳ Minting your affiliate link via ACP agent — sending shortly!_`);
+      const rateStr = rateInfo ? ` · ${(rateInfo.rate * 100).toFixed(0)}% rebate` : "";
+      lines.push(`→ via *${name}*${rateStr} — _sending your link shortly!_ ⏳`);
+    } else if (!purchaseReady && matched) {
+      // Browsing mode — just show the platform, don't mention links
+      const name = matched.info?.name ?? cat.platform_search;
+      const rateInfo = extractRate(matched.info);
+      const rateStr = rateInfo ? ` (${(rateInfo.rate * 100).toFixed(0)}% rebate available)` : "";
+      lines.push(`→ Available on ${name}${rateStr}`);
     } else if (matched) {
       const name = matched.info?.name ?? cat.platform_search;
-      lines.push(`→ via ${name} _(set your wallet to get a cashback link)_`);
+      lines.push(`→ via ${name}`);
     } else {
-      lines.push(`→ via ${cat.platform_search} _(not yet on our affiliate network)_`);
+      lines.push(`→ via ${cat.platform_search}`);
     }
 
     lines.push(""); // blank line between categories
   }
 
-  // Footer: always show dollar estimate when we have price data
-  if (totalCashback > 0.005) {
-    const estLabel = anyEstimate ? "est. " : "";
-    lines.push(
-      `_Book through these links and receive ${estLabel}*$${totalCashback.toFixed(2)} USDC* in cashback 💸_\n` +
-      `_↳ ${cashbackBreakdown.join(" · ")}_`
-    );
-  } else {
-    // Fallback: show rate percentages without dollar calc
-    const rateItems = enriched
-      .filter((e) => e.link?.shortlink)
-      .map((e) => {
-        const r = extractRate(e.info);
-        return r ? `${e.info?.name ?? e.label} (${(r.rate * 100).toFixed(0)}%)` : null;
-      })
-      .filter(Boolean)
-      .slice(0, 3);
-
-    if (rateItems.length > 0) {
-      lines.push(`_Book through these links and earn USDC cashback — ${rateItems.join(", ")} 💸_`);
+  if (purchaseReady) {
+    // Show cashback footer only when minting links
+    if (totalCashback > 0.005) {
+      const estLabel = anyEstimate ? "est. " : "";
+      lines.push(
+        `_Book through these links and receive ${estLabel}*$${totalCashback.toFixed(2)} USDC* in rebate 💸_\n` +
+        `_↳ ${cashbackBreakdown.join(" · ")}_`
+      );
     } else {
-      lines.push(`_Book through these links and earn USDC cashback 💸_`);
+      const rateItems = enriched
+        .filter((e) => e.acpJob || e.link?.shortlink)
+        .map((e) => {
+          const r = extractRate(e.info);
+          return r ? `${e.info?.name ?? e.label} (${(r.rate * 100).toFixed(0)}%)` : null;
+        })
+        .filter(Boolean)
+        .slice(0, 3);
+      if (rateItems.length > 0) {
+        lines.push(`_Book through these links and earn USDC rebates — ${rateItems.join(", ")} 💸_`);
+      }
     }
+  } else {
+    // Browsing mode — soft close, invite them to pick
+    lines.push(`Which of these catches your eye? Happy to dig deeper or send you a booking link when you're ready!`);
   }
 
-  // Country reminder
   if (userCountry) {
-    lines.push(`\n_Links curated for *${userCountry}*. Somewhere else? \`/setcountry\`_`);
+    lines.push(`\n_Showing options for *${userCountry}*. Different region? \`/setcountry\`_`);
   }
 
-  // Dashboard nudge — links work for everyone; wallet only needed for /dashboard
   if (!hasWallet) {
     lines.push(
-      `\n📊 _Want to track your cashback activity? Save your wallet:_\n\`/setwallet 0xYourAddress\``
+      `\n📊 _Want to track your rebates? Save your wallet:_\n\`/setwallet 0xYourAddress\``
     );
   }
 
@@ -606,10 +639,10 @@ async function _processMessage(
       reply = await chat(messages);
 
     } else if (hasCategories) {
-      // We have enough to search merchants — always run tools even if dates missing
-      console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"}`);
-      const enriched = await runTools(intent, walletAddress);
-      reply = buildReply(intent, enriched, !!walletAddress, userCountry);
+      const purchaseReady = intent.purchase_ready ?? false;
+      console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"} | purchase_ready=${purchaseReady}`);
+      const enriched = await runTools(intent, walletAddress, purchaseReady);
+      reply = buildReply(intent, enriched, !!walletAddress, userCountry, purchaseReady);
 
       // For each ACP job in flight, send follow-up when it settles
       if (onFollowUp) {
