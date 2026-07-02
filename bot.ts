@@ -256,30 +256,23 @@ bot.command("dashboard", async (ctx: Context) => {
     const data = await getDashboard({ wallet_address: wallet, include: ["conversions"] });
 
     // balance is a nested object from the Laguna API
-    let availableStr = "N/A";
-    let pendingStr = "N/A";
-    let totalEarnedStr = "N/A";
-    const bal = data.balance;
-    if (bal && typeof bal === "object" && !Array.isArray(bal)) {
-      const b = bal as { available_usdc?: string; pending_usdc?: string; total_earned_usdc?: string };
-      availableStr = `$${b.available_usdc ?? "0"} USDC`;
-      pendingStr = `$${b.pending_usdc ?? "0"} USDC`;
-      totalEarnedStr = `$${b.total_earned_usdc ?? "0"} USDC`;
-    } else if (bal !== undefined) {
-      availableStr = `$${bal} USDC`;
-    }
+    const bal = data.balance as { available_usdc?: string } | undefined;
+    const availableStr = `$${bal?.available_usdc ?? "0"} USDC`;
 
-    const summary = data.summary as { total_conversions?: number } | undefined;
-    const conversions = Array.isArray(data.conversions)
-      ? data.conversions.length
-      : (summary?.total_conversions ?? "N/A");
+    // "Pending" = sum of commissions from unconfirmed conversions
+    type Conv = { status?: string; commission?: string };
+    const convList = (Array.isArray(data.conversions) ? data.conversions : []) as Conv[];
+    const pendingAmount = convList
+      .filter((c) => c.status === "pending")
+      .reduce((sum, c) => sum + parseFloat(c.commission ?? "0"), 0);
+    const pendingStr = `$${pendingAmount.toFixed(3)} USDC`;
+    const conversions = convList.length;
 
     await ctx.api.editMessageText(
       ctx.chat!.id, msg.message_id,
       `📊 *Your Opi Dashboard*\n\n` +
-      `💰 Available: *${availableStr}*\n` +
-      `⏳ Pending: *${pendingStr}*\n` +
-      `🏆 Total Earned: *${totalEarnedStr}*\n` +
+      `⏳ Pending conversions: *${pendingStr}*\n` +
+      `💰 Available to withdraw: *${availableStr}*\n` +
       `🔗 Conversions: *${conversions}*\n\n` +
       `Wallet: \`${wallet}\`\n` +
       `_Payouts sent to your wallet_`,
