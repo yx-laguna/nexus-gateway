@@ -103,7 +103,7 @@ const GoalIntentSchema = z.object({
   goal: z.string(),
   intent: z.enum(["travel_booking", "retail_shopping", "product_comparison", "general_question", "dashboard", "off_topic"]).default("general_question"),
   categories: z.array(CategorySchema).default([]),
-  geo: z.string().length(2).nullish(),   // LLM outputs null when no country — nullish() accepts null|undefined
+  geo: z.string().nullish(),   // always overridden from user profile — LLM output is discarded
   needs_clarification: z.boolean().default(false),
   clarification_question: z.string().nullish(),
   is_dashboard_query: z.boolean().default(false),
@@ -154,7 +154,6 @@ Set purchase_ready: false if they're still exploring, asking "what's good", or h
       "platform_search": string
     }
   ],
-  "geo": string|null,
   "needs_clarification": bool,
   "clarification_question": string|null,
   "is_dashboard_query": bool,
@@ -191,7 +190,10 @@ Max 4 categories. Output JSON only.`,
   const raw = await chat(prompt, true);
 
   try {
-    return GoalIntentSchema.parse(JSON.parse(raw));
+    const parsed = GoalIntentSchema.parse(JSON.parse(raw));
+    // geo is always set from the user's profile, not the LLM output
+    parsed.geo = null;
+    return parsed;
   } catch (err) {
     // Log the full Zod error so we can see exactly which field failed
     console.warn("[agent] intent parse failed, falling back to general_question.");
@@ -565,7 +567,7 @@ export async function processMessage(
   history.push({ role: "user", content: text });
 
   // Timeout covers only the fast path (LLM + Laguna search); ACP runs beyond this
-  const PIPELINE_TIMEOUT_MS = 30_000;
+  const PIPELINE_TIMEOUT_MS = 50_000;
   let timeoutId: ReturnType<typeof setTimeout>;
   const timeoutPromise = new Promise<string>((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error("pipeline timeout")), PIPELINE_TIMEOUT_MS);
