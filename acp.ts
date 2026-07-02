@@ -231,8 +231,69 @@ async function _acpMintLink(params: {
 
   return new Promise<MintedLink>((resolve, reject) => {
     pending.set(jobIdStr, { resolve, reject });
+
+    // ── Polling fallback ────────────────────────────────────────────────────
+    // The client socket can drop silently. If that happens the socket-driven
+    // handlers (budget.set → fund, job.completed → resolve) never fire.
+    // We poll the job's chat history every 5 s so the critical path still
+    // works even when the socket is stale.
+    let funded = false;
+    const pollInterval = setInterval(async () => {
+      if (!pending.has(jobIdStr)) { clearInterval(pollInterval); return; }
+      try {
+        const transport = (acpClient as unknown as { transport: { getHistory: (c: number, j: string) => Promise<Array<{ kind: string; event?: { type?: string; deliverable?: string; budget?: { amount?: number } } }>> } }).transport;
+        const history = await transport.getHistory(base.id, jobIdStr);
+
+        type HistEntry = { kind: string; event?: { type?: string; deliverable?: string; budget?: { amount?: number } } };
+        const byType = (t: string) => history.find((e: HistEntry) => e.kind === "system" && e.event?.type === t);
+
+        const submitEntry = byType("job.submitted");
+        const completedEntry = byType("job.completed");
+
+        // If submitted or completed — extract deliverable and resolve
+        if ((submitEntry || completedEntry) && pending.has(jobIdStr)) {
+          const raw = (submitEntry ?? completedEntry)?.event?.deliverable;
+          if (raw) {
+            const d = JSON.parse(raw) as { payload?: { shortlink?: string; merchant_id?: string }; shortlink?: string; merchant_id?: string };
+            const shortlink = d?.payload?.shortlink ?? d?.shortlink;
+            const merchant_id = d?.payload?.merchant_id ?? d?.merchant_id ?? "";
+            if (shortlink) {
+              console.log(`[acp] poll: job ${jobIdStr} complete — resolving via history`);
+              clearInterval(pollInterval);
+              pending.delete(jobIdStr);
+              resolve({ shortlink, merchant_id });
+              return;
+            }
+          }
+        }
+
+        // If budget.set found but not yet funded — fund it
+        const budgetEntry = byType("budget.set");
+        const fundedEntry = byType("job.funded");
+        if (budgetEntry && !fundedEntry && !funded) {
+          funded = true;
+          console.log(`[acp] poll: budget.set in history for job ${jobIdStr} — funding (socket fallback)`);
+          try {
+            const agentAny = acpClient as unknown as { getOrCreateSession?: (id: string, chainId: number, entries: unknown[]) => { fund: (t: unknown) => Promise<void> } };
+            const session = agentAny.getOrCreateSession?.(jobIdStr, base.id, history);
+            const amt = budgetEntry.event?.budget?.amount ?? 0.01;
+            if (session) {
+              await session.fund(AssetToken.usdc(Number(amt), base.id));
+              console.log(`[acp] poll: funded job ${jobIdStr} with ${amt} USDC`);
+            }
+          } catch (fundErr) {
+            console.warn(`[acp] poll: fund failed for job ${jobIdStr}:`, fundErr instanceof Error ? fundErr.message : fundErr);
+            funded = false; // allow retry next tick
+          }
+        }
+      } catch (pollErr) {
+        console.warn(`[acp] poll error for job ${jobIdStr}:`, pollErr instanceof Error ? pollErr.message : pollErr);
+      }
+    }, 5_000);
+
     setTimeout(() => {
       if (pending.has(jobIdStr)) {
+        clearInterval(pollInterval);
         pending.delete(jobIdStr);
         reject(new Error(`[acp] Job ${jobIdStr} timed out (90s waiting for provider)`));
       }
