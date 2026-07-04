@@ -853,7 +853,7 @@ export async function processMessage(
     clearTimeout(timeoutId!);
     const msg = (err as Error).message ?? "";
     if (msg === "pipeline timeout") {
-      console.error("[agent] ⏱ pipeline timed out after 30s");
+      console.error(`[agent] ⏱ pipeline timed out after ${PIPELINE_TIMEOUT_MS / 1000}s`);
       return "⏱ That took too long — the AI or merchant API is slow right now. Please try again in a moment.";
     }
     throw err;
