@@ -52,10 +52,14 @@ Conversational, warm, knowledgeable — like a friend who knows all the best dea
 - Don't mention rebates or links until the user shows clear purchase intent.
 
 ## Purchase intent signals (system will then send links)
-Examples: "I'll go with...", "book this", "I want to buy", "send me the link", "which one should I get"
+Only an explicit request for the link itself counts — e.g. "give me the link to book", "send me
+the purchase link", "link please". Deciding on an option ("I'll go with the Marriott", "book
+this one") is NOT the same as asking for the link — if they haven't asked for a link yet, keep
+talking naturally and don't offer one unprompted.
 
 ## When there's no purchase intent yet
 - Present options warmly, ask what resonates, offer to dig deeper.
+- If they've decided but haven't asked for the link, it's fine to ask "want the link to book that?"
 - Do NOT say "I'll send a link" or mention cashback/ACP mechanics.
 
 ## What you NEVER do
@@ -157,10 +161,14 @@ Today's date is ${todayISO}. Resolve any relative date the user mentions ("next 
 - "off_topic": nothing to do with travel or shopping. Set is_off_topic: true.
 
 ## purchase_ready detection
-Set purchase_ready: true ONLY if the user explicitly signals they want to proceed NOW:
-- "book this", "I'll go with", "I want to buy", "send me the link", "get me the link", "which one should I get", "how do I book", "let's do it", "I'm ready"
-- Asking to compare two specific named options also counts (they're close to deciding)
-Set purchase_ready: false if they're still exploring, asking "what's good", or haven't picked anything.
+Set purchase_ready: true ONLY if the user EXPLICITLY asks for the link to book or purchase —
+e.g. "give me the link to book", "send me the purchase link", "can I get the booking link",
+"link please", "share the link so I can buy it". This must be a direct request for the link
+itself, not just general enthusiasm or a decision.
+Set purchase_ready: false for everything else — including "book this", "I'll go with the
+Marriott", "I want to buy it", "let's do it", "I'm ready", or comparing named options. Those
+signal a decision, not a request for the link, so keep purchase_ready: false until they
+explicitly ask for the link. When in doubt, default to false.
 
 ## Hotel search fields (only fill when a hotel/stay/accommodation category is present)
 - "destination_city": ONLY the city or place name the hotel search is for — e.g. "Bangkok", "Singapore", "New York". NEVER a full sentence, NEVER a neighbourhood-only value, NEVER the category label. This is looked up in an exact city database, so it must be just the place name a city lookup would recognise. Null if no destination is clear yet.
@@ -413,6 +421,20 @@ async function runTools(
         // Primary = trip-com, extra = agoda (or swap if trip-com failed)
         const primary = trip ?? agoda!;
         const extra = trip && agoda ? agoda : null;
+
+        // Browsing mode — resolve merchant info (so the reply can still show the rebate %)
+        // but don't spend an ACP mint on links nobody asked for yet. Same gate every other
+        // category already respects; hotels used to always-mint regardless — now consistent.
+        if (!mintLinks) {
+          console.log(`[agent] hotel: browsing mode, skipping ACP mint for "${cat.label}"`);
+          return {
+            label: cat.label,
+            recommendations: cat.recommendations,
+            info: primary.info,
+            link: null,
+            agodaSmart,
+          } satisfies EnrichedCategory;
+        }
 
         mintedMerchants.add(primary.id);
         const primaryJob = mintJob(primary.id, intent.geo);
