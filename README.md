@@ -48,11 +48,38 @@ User (Telegram)
 
 - 🌍 **Travel planning** — flights, hotels, activities, cruises, car rentals
 - 🛍️ **Retail shopping** — fashion, electronics, health, sports
+- 🏨 **Smart Agoda hotel search** — real, live, dated hotel inventory ranked by Kimi against
+  whatever you said mattered (price, distance, vibe) — see below
 - 💸 **Real cashback math** — shows `merchant rate × spend = $X USDC` before you click
 - 👛 **Your wallet, your cashback** — supports EVM (`0x...`) and TON (`UQ...`) wallets
 - 🔗 **Only real links** — every link is minted live via Laguna MCP, never fabricated
 - 🌐 **Country-aware** — merchants and rates filtered by your shopping country
 - 📊 **Dashboard** — track your affiliate earnings with `/dashboard`
+
+---
+
+## Smart Agoda Hotel Search
+
+For hotel requests, the bot goes beyond a generic affiliate homepage link. When you give it a
+destination and dates, it:
+
+1. Resolves your destination to an Agoda `city_id` (`agoda-city-lookup.ts`, 50k+ cities)
+2. Calls the real **Agoda Affiliate Long Tail Search API** for live, priced, bookable hotels
+   (`agoda-api.ts`)
+3. Enriches each result with address/geo/description from a local hotel database
+   (`agoda-db.ts`)
+4. Has Kimi rank the top 3 against whatever you said mattered — price, location, vibe
+   (`agoda-search.ts`)
+
+The winning pick's `landingURL` — already tagged with the Agoda affiliate site ID and your
+exact dates — is the dedicated booking link, revealed once you signal you're ready to book
+(same `purchase_ready` gate as everything else). This runs *alongside* the existing Trip.com +
+Agoda dual mint via Laguna/ACP, not instead of it.
+
+Requires a persistent disk (hotel enrichment DB, ~390MB) and two extra env vars
+(`AGODA_SITE_ID`, `AGODA_API_KEY`) — see **`NOTES-agoda-hosting.md`** for the full setup and
+hosting rationale. Rebuild the DB from a fresh CSV export anytime with
+`scripts/build-agoda-db.py`.
 
 ---
 
@@ -89,6 +116,10 @@ npm run dev
 | `ZG_ENDPOINT` | 0G Compute provider endpoint URL |
 | `ZG_SERVICE_NAME` | Model name, e.g. `deepseek-chat-v3-0324` |
 | `LAGUNA_MCP_URL` | Laguna MCP endpoint (default: `https://agents.laguna.network/mcp`) |
+| `AGODA_SITE_ID` | Agoda affiliate site ID (e.g. `1961841`) |
+| `AGODA_API_KEY` | Agoda Affiliate Long Tail Search API key |
+| `AGODA_DB_PATH` | Path to the built `agoda_hotels.sqlite` (see `NOTES-agoda-hosting.md`) |
+| `AGODA_CITY_LOOKUP_PATH` | Path to `agoda_city_lookup.json` |
 
 ---
 
@@ -105,10 +136,15 @@ Deployed as a **Render web service** (Node, Starter plan):
 ## Stack
 
 ```
-bot.ts      — Telegram bot, onboarding, user profiles (grammY)
-agent.ts    — 3-step pipeline: intent → merchant search → reply builder
-laguna.ts   — Laguna MCP client (JSON-RPC over HTTP, session management)
-broker.ts   — 0G Compute LLM client (OpenAI-compatible, retry + backoff)
+bot.ts               — Telegram bot, onboarding, user profiles (grammY)
+agent.ts             — 3-step pipeline: intent → merchant search → reply builder
+laguna.ts            — Laguna MCP client (JSON-RPC over HTTP, session management)
+broker.ts            — 0G Compute LLM client (OpenAI-compatible, retry + backoff)
+acp.ts               — ACP v2 client (mint jobs via ACPLagunaTranslator)
+agoda-api.ts         — Agoda Affiliate Long Tail Search API client
+agoda-db.ts          — SQLite lookup for hotel address/geo/description enrichment
+agoda-city-lookup.ts — destination name -> Agoda city_id resolution
+agoda-search.ts       — orchestrates search -> enrich -> Kimi ranking for hotels
 ```
 
 ---

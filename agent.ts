@@ -26,6 +26,7 @@ import {
   type MintedLink,
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
+import { smartSearchHotels, type SmartSearchResult } from "./agoda-search.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -113,6 +114,17 @@ const GoalIntentSchema = z.object({
    * false = user is browsing/exploring — show options but don't mint links yet
    */
   purchase_ready: z.boolean().default(false),
+  // ── Hotel-search fields (only meaningful when a "hotel"-type category is present) ──
+  // Populated opportunistically from anywhere in the conversation — null if not mentioned yet.
+  // Dates are resolved to absolute YYYY-MM-DD by the LLM (it's given today's date to do this).
+  checkin_date: z.string().nullish(),
+  checkout_date: z.string().nullish(),
+  adults: z.number().int().min(1).max(20).nullish(),
+  children: z.number().int().min(0).max(10).nullish(),
+  budget_max_per_night: z.number().positive().nullish(),
+  // Free text describing what matters to the traveller for hotel choice —
+  // location/distance, vibe, amenities — passed to Kimi for ranking, not a fixed filter.
+  hotel_preference_text: z.string().nullish(),
 });
 
 type GoalIntent = z.infer<typeof GoalIntentSchema>;
@@ -124,10 +136,14 @@ async function extractIntent(
   // Only pass last 4 turns to keep this call cheap
   const nonSystemHistory = history.filter((m) => m.role !== "system").slice(-4);
 
+  const todayISO = new Date().toISOString().slice(0, 10);
+
   const prompt: ChatMessage[] = [
     {
       role: "system",
       content: `You are an intent detection and goal-decomposition engine for a travel and retail deals assistant.
+
+Today's date is ${todayISO}. Resolve any relative date the user mentions ("next weekend", "in August", "3 nights from Friday") to absolute YYYY-MM-DD dates using this as the reference point.
 
 ## Intent detection (pick ONE)
 - "travel_booking": user wants to book flights, hotels, car rentals, activities, or plan a trip.
@@ -142,6 +158,13 @@ Set purchase_ready: true ONLY if the user explicitly signals they want to procee
 - "book this", "I'll go with", "I want to buy", "send me the link", "get me the link", "which one should I get", "how do I book", "let's do it", "I'm ready"
 - Asking to compare two specific named options also counts (they're close to deciding)
 Set purchase_ready: false if they're still exploring, asking "what's good", or haven't picked anything.
+
+## Hotel search fields (only fill when a hotel/stay/accommodation category is present)
+- "checkin_date" / "checkout_date": absolute YYYY-MM-DD, resolved from whatever the user said relative to today (${todayISO}). Null if no dates mentioned at all — do NOT guess dates the user never implied.
+- "adults" / "children": default adults=2, children=0 if travel party size isn't mentioned.
+- "budget_max_per_night": a number if the user gave any per-night/total budget hint, else null.
+- "hotel_preference_text": short free text capturing what the traveller cares about for THIS hotel search — location/distance cues ("near the beach", "walkable to downtown", "close to the conference venue"), vibe, must-have amenities. Null if nothing beyond price/stars was said.
+- If checkin_date or checkout_date is missing for a hotel search, set needs_clarification: true and ask for dates in clarification_question — but still fill in categories/recommendations from what you know so the user gets a useful reply either way.
 
 ## Output — ONLY valid JSON, no explanation:
 {
@@ -158,7 +181,13 @@ Set purchase_ready: false if they're still exploring, asking "what's good", or h
   "clarification_question": string|null,
   "is_dashboard_query": bool,
   "is_off_topic": bool,
-  "purchase_ready": bool
+  "purchase_ready": bool,
+  "checkin_date": string|null,
+  "checkout_date": string|null,
+  "adults": number|null,
+  "children": number|null,
+  "budget_max_per_night": number|null,
+  "hotel_preference_text": string|null
 }
 
 ## Recommendation format — ALWAYS give exactly 3, be specific and add context:
@@ -206,6 +235,7 @@ Max 4 categories. Output JSON only.`,
       is_dashboard_query: false,
       is_off_topic: false,
       needs_clarification: false,
+      purchase_ready: false,
     };
   }
 }
@@ -231,6 +261,10 @@ export interface EnrichedCategory {
   acpJob?: Promise<MintedLink>;
   // Extra platforms minted in parallel (e.g. agoda alongside trip-com for hotels)
   extraPlatforms?: PlatformJob[];
+  // Real, live, Kimi-ranked Agoda hotel picks (hotel categories only — see agoda-search.ts).
+  // Independent of the Laguna/ACP mint above: this is real search + a dedicated booking
+  // URL per hotel, not a generic merchant homepage link.
+  agodaSmart?: SmartSearchResult;
 }
 
 async function runTools(
@@ -318,22 +352,56 @@ async function runTools(
 
   // Per-category: try platforms in order until one mint succeeds
   const categoryResults = await Promise.allSettled(
-    intent.categories.map(async (cat) => {
+    intent.categories.map(async (cat): Promise<EnrichedCategory> => {
       const platforms = platformsForCategory(cat.label, cat.platform_search);
       const isHotel = HOTEL_RE.test(cat.label);
       console.log(`[agent] category "${cat.label}" isHotel=${isHotel} — trying platforms:`, platforms);
 
-      // For hotels: always mint BOTH trip-com and agoda in parallel
+      // For hotels: always mint BOTH trip-com and agoda in parallel, AND (new) run a
+      // real Agoda inventory search + Kimi ranking alongside it whenever we have
+      // enough info (destination + dates) to actually search.
       if (isHotel) {
-        const [tripResult, agodaResult] = await Promise.allSettled([
+        const canSmartSearch = !!(intent.checkin_date && intent.checkout_date);
+        const smartSearchPromise = canSmartSearch
+          ? smartSearchHotels({
+              cityQuery: cat.label.toLowerCase().includes("hotel") ? intent.goal : cat.label,
+              checkinDate: intent.checkin_date!,
+              checkoutDate: intent.checkout_date!,
+              adults: intent.adults ?? 2,
+              children: intent.children ?? 0,
+              budgetMaxPerNight: intent.budget_max_per_night ?? undefined,
+              preferenceText: intent.hotel_preference_text ?? undefined,
+              countryHint: intent.geo,
+            }).catch((err) => {
+              console.error(`[agent] smartSearchHotels failed:`, err instanceof Error ? err.message : err);
+              return null;
+            })
+          : Promise.resolve(null);
+
+        const [tripResult, agodaResult, smartSearchResult] = await Promise.allSettled([
           resolveMerchant("trip-com", intent.geo),
           resolveMerchant("agoda", intent.geo),
+          smartSearchPromise,
         ]);
 
         const trip = tripResult.status === "fulfilled" ? tripResult.value : null;
         const agoda = agodaResult.status === "fulfilled" ? agodaResult.value : null;
+        const agodaSmart = smartSearchResult.status === "fulfilled" ? smartSearchResult.value ?? undefined : undefined;
 
-        if (!trip && !agoda) throw new Error(`No hotel merchants available for ${cat.label}`);
+        if (!trip && !agoda && !agodaSmart) throw new Error(`No hotel merchants available for ${cat.label}`);
+
+        // No Laguna-side merchant resolved at all, but the real Agoda search still
+        // came back — return that alone rather than failing the whole category.
+        if (!trip && !agoda) {
+          console.log(`[agent] hotel: no ACP merchant resolved for "${cat.label}", but agodaSmart has ${agodaSmart!.picks.length} pick(s)`);
+          return {
+            label: cat.label,
+            recommendations: cat.recommendations,
+            info: { id: "", name: cat.label } as MerchantInfo,
+            link: null,
+            agodaSmart,
+          } satisfies EnrichedCategory;
+        }
 
         // Primary = trip-com, extra = agoda (or swap if trip-com failed)
         const primary = trip ?? agoda!;
@@ -358,6 +426,7 @@ async function runTools(
           link: null,
           acpJob: primaryJob,
           extraPlatforms,
+          agodaSmart,
         } satisfies EnrichedCategory;
       }
 
@@ -529,23 +598,48 @@ function buildReply(
 
     lines.push(`${emoji} *${cat.label}*`);
 
-    // Show all 3 recommendations as a numbered list
+    const agodaPicks = matched?.agodaSmart?.picks ?? [];
     const recs = cat.recommendations.slice(0, 3);
-    recs.forEach((rec, i) => {
-      lines.push(`${i + 1}. ${rec}`);
-    });
 
-    if (matched) {
-      const primaryName = matched.info?.name ?? matched.info?.id ?? cat.label;
-      const primaryRate = extractRate(matched.info);
+    if (agodaPicks.length > 0) {
+      // Real, live, Kimi-ranked Agoda inventory — grounded facts, not LLM guesses.
+      agodaPicks.forEach((pick, i) => {
+        lines.push(
+          `${i + 1}. *${pick.hotelName}* — ${pick.reasoning} · ~${pick.currency} ${pick.dailyRate.toFixed(0)}/night ` +
+          `(★${pick.starRating} · ${pick.reviewScore}/10)`
+        );
+      });
+    } else {
+      // Fall back to Step 1's LLM-knowledge recommendations (no real search data yet —
+      // e.g. dates not given, or city didn't resolve to an Agoda city_id).
+      recs.forEach((rec, i) => {
+        lines.push(`${i + 1}. ${rec}`);
+      });
+    }
+
+    // Reveal the specific, dated, hotel-tagged Agoda booking link only once the
+    // user is purchase-ready — same "don't push links while browsing" rule as
+    // everything else in this bot.
+    if (agodaPicks.length > 0 && purchaseReady) {
+      const top = agodaPicks[0];
+      lines.push(`→ Book *${top.hotelName}* directly on Agoda: ${top.landingURL}`);
+    }
+
+    // Generic Laguna/ACP merchant line — only when an actual merchant was resolved
+    // (the hotel branch can return agodaSmart alone with no ACP merchant at all).
+    const hasMerchant = !!(matched && (matched.info?.id || matched.link || matched.acpJob));
+
+    if (hasMerchant) {
+      const primaryName = matched!.info?.name ?? matched!.info?.id ?? cat.label;
+      const primaryRate = extractRate(matched!.info);
       const fmtRate = (r: ReturnType<typeof extractRate>) => r ? ` (${(r.rate * 100).toFixed(0)}% rebate)` : "";
 
       // Build one clean booking line
-      if (matched.link?.shortlink) {
-        lines.push(`→ Book via *${primaryName}*${fmtRate(primaryRate)}: ${matched.link.shortlink}`);
-      } else if (matched.acpJob) {
+      if (matched!.link?.shortlink) {
+        lines.push(`→ Book via *${primaryName}*${fmtRate(primaryRate)}: ${matched!.link.shortlink}`);
+      } else if (matched!.acpJob) {
         // Extra platforms inline (e.g. "also on Agoda")
-        const extras = (matched.extraPlatforms ?? []).map(ep => ep.name).join(" & ");
+        const extras = (matched!.extraPlatforms ?? []).map(ep => ep.name).join(" & ");
         const alsoStr = extras ? ` (also on ${extras})` : "";
         lines.push(`→ We recommend booking via *${primaryName}*${fmtRate(primaryRate)}${alsoStr} — _affiliate link coming shortly_ ⏳`);
       } else {
@@ -563,7 +657,8 @@ function buildReply(
           cashbackBreakdown.push(`${primaryName} ${(primaryRate.rate * 100).toFixed(0)}% × $${price} = $${cashback.toFixed(2)}`);
         }
       }
-    } else {
+    } else if (agodaPicks.length === 0) {
+      // Nothing resolved at all for this category — no merchant, no real search results.
       lines.push(`→ via ${cat.platform_search}`);
     }
 

@@ -5,7 +5,25 @@ services:
     buildCommand: npm install
     startCommand: npm run start
     healthCheckPath: /health
+    # Persistent disk for the Agoda hotel enrichment DB (agoda_hotels.sqlite, ~390MB) +
+    # the city name -> city_id lookup JSON (~4.3MB). Neither ships in git — see
+    # NOTES-agoda-hosting.md for how they get onto this disk. Disk survives redeploys;
+    # it's NOT wiped when Render rebuilds the service.
+    disk:
+      name: agoda-data
+      mountPath: /var/data
+      sizeGB: 5
     envVars:
+      # ── Agoda Affiliate Long Tail Search API ─────────────────────────────────
+      - key: AGODA_SITE_ID
+        sync: false          # your Agoda affiliate site ID (same one baked into landingURL)
+      - key: AGODA_API_KEY
+        sync: false          # from Affiliate_Lite_API_V2.0 partnership docs
+      - key: AGODA_DB_PATH
+        value: /var/data/agoda_hotels.sqlite
+      - key: AGODA_CITY_LOOKUP_PATH
+        value: /var/data/agoda_city_lookup.json
+
       # ── Telegram ─────────────────────────────────────────────────────────────
       - key: TELEGRAM_BOT_TOKEN
         sync: false          # fill in Render dashboard

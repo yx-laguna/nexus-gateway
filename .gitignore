@@ -3,3 +3,9 @@ dist/
 .env
 *.env.local
 .DS_Store
+
+# Agoda hotel enrichment data — lives on the Render persistent disk in prod,
+# and locally you should symlink/copy it in for dev rather than commit it
+# (agoda_hotels.sqlite is ~390MB). See NOTES-agoda-hosting.md.
+agoda_hotels.sqlite
+agoda_city_lookup.json
