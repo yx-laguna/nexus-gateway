@@ -116,6 +116,9 @@ const GoalIntentSchema = z.object({
   purchase_ready: z.boolean().default(false),
   // ── Hotel-search fields (only meaningful when a "hotel"-type category is present) ──
   // Populated opportunistically from anywhere in the conversation — null if not mentioned yet.
+  // destination_city MUST be just the city/place name (e.g. "Bangkok") — never a full sentence,
+  // neighbourhood, or the category label. It's fed straight into an exact-match city lookup.
+  destination_city: z.string().nullish(),
   // Dates are resolved to absolute YYYY-MM-DD by the LLM (it's given today's date to do this).
   checkin_date: z.string().nullish(),
   checkout_date: z.string().nullish(),
@@ -160,11 +163,12 @@ Set purchase_ready: true ONLY if the user explicitly signals they want to procee
 Set purchase_ready: false if they're still exploring, asking "what's good", or haven't picked anything.
 
 ## Hotel search fields (only fill when a hotel/stay/accommodation category is present)
+- "destination_city": ONLY the city or place name the hotel search is for — e.g. "Bangkok", "Singapore", "New York". NEVER a full sentence, NEVER a neighbourhood-only value, NEVER the category label. This is looked up in an exact city database, so it must be just the place name a city lookup would recognise. Null if no destination is clear yet.
 - "checkin_date" / "checkout_date": absolute YYYY-MM-DD, resolved from whatever the user said relative to today (${todayISO}). Null if no dates mentioned at all — do NOT guess dates the user never implied.
 - "adults" / "children": default adults=2, children=0 if travel party size isn't mentioned.
 - "budget_max_per_night": a number if the user gave any per-night/total budget hint, else null.
 - "hotel_preference_text": short free text capturing what the traveller cares about for THIS hotel search — location/distance cues ("near the beach", "walkable to downtown", "close to the conference venue"), vibe, must-have amenities. Null if nothing beyond price/stars was said.
-- If checkin_date or checkout_date is missing for a hotel search, set needs_clarification: true and ask for dates in clarification_question — but still fill in categories/recommendations from what you know so the user gets a useful reply either way.
+- If destination_city, checkin_date, or checkout_date is missing for a hotel search, set needs_clarification: true and ask for whichever is missing in clarification_question — but still fill in categories/recommendations from what you know so the user gets a useful reply either way.
 
 ## Output — ONLY valid JSON, no explanation:
 {
@@ -182,6 +186,7 @@ Set purchase_ready: false if they're still exploring, asking "what's good", or h
   "is_dashboard_query": bool,
   "is_off_topic": bool,
   "purchase_ready": bool,
+  "destination_city": string|null,
   "checkin_date": string|null,
   "checkout_date": string|null,
   "adults": number|null,
@@ -361,10 +366,12 @@ async function runTools(
       // real Agoda inventory search + Kimi ranking alongside it whenever we have
       // enough info (destination + dates) to actually search.
       if (isHotel) {
-        const canSmartSearch = !!(intent.checkin_date && intent.checkout_date);
+        // destination_city is a clean place name from the LLM (e.g. "Bangkok") — required for
+        // an exact-match city lookup. cat.label/intent.goal are full sentences and never match.
+        const canSmartSearch = !!(intent.destination_city && intent.checkin_date && intent.checkout_date);
         const smartSearchPromise = canSmartSearch
           ? smartSearchHotels({
-              cityQuery: cat.label.toLowerCase().includes("hotel") ? intent.goal : cat.label,
+              cityQuery: intent.destination_city!,
               checkinDate: intent.checkin_date!,
               checkoutDate: intent.checkout_date!,
               adults: intent.adults ?? 2,
