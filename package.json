@@ -4,7 +4,7 @@
   "description": "AI shopping agent Telegram bot powered by 0G Compute (DeepSeek V3) and Laguna affiliate tools",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "dev": "tsx --watch bot.ts",
@@ -14,14 +14,12 @@
   "dependencies": {
     "@account-kit/infra": "^4.0.0",
     "@virtuals-protocol/acp-node-v2": "^0.0.4",
-    "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.5",
     "grammy": "^1.31.0",
     "openai": "^4.77.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"

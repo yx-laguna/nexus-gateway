@@ -2,17 +2,26 @@
  * agoda-db.ts
  *
  * Read-only query layer over the pre-built SQLite hotel database (see
- * scripts/build-agoda-db.mjs), which was generated offline from
- * Agoda_Hotels_EN.csv (1.25M rows). We only ever need it for enrichment —
- * address, geo, accommodation type, a short description snippet — keyed by
- * hotelId from a live Agoda API search response. All pricing/availability
- * comes from the live API, never from this file (it can go stale).
+ * scripts/build-agoda-db.py), which was generated offline from
+ * Agoda_Hotels_EN.csv (1.25M rows). Used by agoda-search.ts's Stage A
+ * (local-first search) to build a candidate pool before ever touching
+ * the live Agoda API.
  *
  * The .sqlite file lives on a persistent Render disk (see render.yaml),
  * not in git — see NOTES-agoda-hosting.md for how it gets there.
+ *
+ * Uses Node's built-in `node:sqlite` module (DatabaseSync) rather than the
+ * `better-sqlite3` native addon. better-sqlite3 needs to compile a C++
+ * binding against V8 at install time, and Render's Node 26.4.0 build image
+ * removed several V8 APIs (Context::GetIsolate, PropertyCallbackInfo::This,
+ * Object::GetPrototype) that better-sqlite3's bundled version still called —
+ * the compile failed on every deploy, silently (the build script didn't
+ * propagate the failure), so the app ran with no local DB at all. node:sqlite
+ * ships inside Node itself (stable/RC since v25.7.0) — no compilation, no
+ * bindings-file lookup, no ABI mismatch possible.
  */
 
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 
 export interface HotelRow {
   hotel_id: number;
@@ -36,15 +45,14 @@ export interface HotelRow {
 
 const DB_PATH = process.env.AGODA_DB_PATH ?? "./agoda_hotels.sqlite";
 
-let _db: Database.Database | null = null;
+let _db: DatabaseSync | null = null;
 let _openFailed = false;
 
-function getDb(): Database.Database {
+function getDb(): DatabaseSync {
   if (_db) return _db;
   if (_openFailed) throw new Error(`[agoda-db] previously failed to open ${DB_PATH}`);
   try {
-    _db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
-    _db.pragma("query_only = true");
+    _db = new DatabaseSync(DB_PATH, { readOnly: true });
     console.log(`[agoda-db] opened ${DB_PATH}`);
     return _db;
   } catch (err) {
@@ -75,7 +83,7 @@ export function searchHotelsByCityId(cityId: number, limit = 500): HotelRow[] {
   const stmt = db.prepare(
     `SELECT * FROM hotels WHERE city_id = ? ORDER BY rating_average DESC, number_of_reviews DESC LIMIT ?`
   );
-  return stmt.all(cityId, limit) as HotelRow[];
+  return stmt.all(cityId, limit) as unknown as HotelRow[];
 }
 
 /** Look up enrichment rows for a batch of hotel IDs (from a live API search response). */
@@ -90,7 +98,7 @@ export function getHotelsByIds(hotelIds: number[]): Map<number, HotelRow> {
     const chunk = hotelIds.slice(i, i + CHUNK);
     const placeholders = chunk.map(() => "?").join(",");
     const stmt = db.prepare(`SELECT * FROM hotels WHERE hotel_id IN (${placeholders})`);
-    const rows = stmt.all(...chunk) as HotelRow[];
+    const rows = stmt.all(...chunk) as unknown as HotelRow[];
     for (const row of rows) result.set(row.hotel_id, row);
   }
   return result;

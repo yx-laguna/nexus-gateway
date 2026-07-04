@@ -105,3 +105,30 @@ AGODA_API_KEY=...
 
 InvolveAsia deeplink affiliate integration — you said this is next-phase work. No scaffolding was
 added for it so it doesn't clutter this change; happy to start on it whenever you're ready.
+
+## 2026-07-04: better-sqlite3 → node:sqlite (fixed native binding failure)
+
+Real deploy logs showed `[agoda-db] unavailable ... Could not locate the bindings file`, meaning
+Stage A (local search) never ran — every hotel reply was silently falling back to Step 1's
+LLM-guessed names, with none of the distance/`(est.)`/rating markers. Root cause: Render's Node
+version is **26.4.0** (picked automatically because `package.json` only said `>=20`), and
+`better-sqlite3`'s bundled C++ addon failed to compile against it —
+
+```
+./src/objects/statement.lzz:322:81: error: 'const class v8::PropertyCallbackInfo<v8::Value>' has no member named 'This'
+./src/better_sqlite3.lzz:68:34: error: 'class v8::Context' has no member named 'GetIsolate'
+./src/util/binder.lzz:40:37: error: 'class v8::Object' has no member named 'GetPrototype'
+```
+
+Node 26's V8 removed those APIs. There's also no prebuilt binary for Node 26 yet, so it fell back
+to source compile — which failed — and because the build script (`"build": "echo 'build ok'"`)
+doesn't propagate `npm install`'s exit code, Render reported "Build successful" anyway and deployed
+a broken artifact.
+
+**Fix:** replaced `better-sqlite3` with Node's built-in `node:sqlite` module (`DatabaseSync`) in
+`agoda-db.ts`. It's shipped inside Node itself (RC/stable since v25.7.0, well within our Node
+26.4.0), so there's nothing to compile and no bindings file to locate — this failure mode is gone
+for good. Also removed the `better-sqlite3`/`@types/better-sqlite3` deps from `package.json` and
+tightened `engines.node` to `>=22.5.0` (the version `node:sqlite` first shipped in) so a future
+downgrade can't silently break this again. Verified: `tsc --noEmit` still shows the same 9
+pre-existing, unrelated errors — nothing new from this change.
