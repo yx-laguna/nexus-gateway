@@ -65,6 +65,19 @@ export function isAgodaDbAvailable(): boolean {
   }
 }
 
+/**
+ * Local-first hotel search — all hotels in a city, ordered by rating, no live API call.
+ * Used by agoda-search.ts's Stage A (searchLocalHotels) to build a candidate pool that gets
+ * distance/budget filtered and Kimi-ranked before ever touching the live Agoda API.
+ */
+export function searchHotelsByCityId(cityId: number, limit = 500): HotelRow[] {
+  const db = getDb();
+  const stmt = db.prepare(
+    `SELECT * FROM hotels WHERE city_id = ? ORDER BY rating_average DESC, number_of_reviews DESC LIMIT ?`
+  );
+  return stmt.all(cityId, limit) as HotelRow[];
+}
+
 /** Look up enrichment rows for a batch of hotel IDs (from a live API search response). */
 export function getHotelsByIds(hotelIds: number[]): Map<number, HotelRow> {
   const result = new Map<number, HotelRow>();

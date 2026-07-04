@@ -1,76 +1,130 @@
 /**
  * agoda-search.ts
  *
- * The new feature: "smart" Agoda hotel search.
+ * Two-stage hotel search, so the live Agoda API is only ever called when the
+ * user actually asks for real-time prices:
  *
- *   1. Resolve the destination the user mentioned to an Agoda city ID
- *      (agoda-city-lookup.ts, built from Agoda_Hotels_EN.csv).
- *   2. Call the real Agoda Long Tail Search API for that city + dates
- *      (agoda-api.ts) — up to 30 live, priced, bookable hotels.
- *   3. Enrich each candidate with address/geo/description from the local
- *      hotel DB (agoda-db.ts) — the API alone doesn't return an address.
- *   4. Hand the enriched candidate list to Kimi (via broker.chat, same
- *      Virtuals Agent Compute path the rest of the bot uses) and ask it to
- *      rank the top 3 against whatever the user said mattered to them
- *      (distance/vibe/price/etc — free text, not a fixed filter).
+ *   Stage A — searchLocalHotels() — ALWAYS runs (blended into the first reply)
+ *     1. Resolve the destination to an Agoda city_id (agoda-city-lookup.ts).
+ *     2. Pull a candidate pool straight from the local hotel DB (agoda-db.ts,
+ *        built offline from Agoda_Hotels_EN.csv) — no live API call, free, fast.
+ *     3. If the traveller gave a location preference ("near Thonglor"), ask
+ *        Kimi to estimate that place's lat/lon from its own knowledge, then
+ *        compute real haversine distance from every candidate hotel (the CSV
+ *        has hotel lat/lon) and sort/filter by it.
+ *     4. Filter by budget using the CSV's rates_from (a static estimate).
+ *     5. Kimi ranks the top 3, citing distance/price/rating explicitly.
  *
- * The winning pick's landingURL from the live API response IS the dedicated,
- * hotel-specific, dated booking link — cid=<AGODA_SITE_ID> is already baked
- * in by Agoda, so there's nothing further to construct.
+ *   Stage B — fetchLiveAgodaPrices() — only runs when the user explicitly asks
+ *     for real-time prices, or asks for the booking link (which needs live
+ *     data to exist regardless). Calls the live Agoda hotel-list-search for
+ *     exactly the Stage A picks and merges in real dailyRate/landingURL/etc.
+ *
+ * The winning pick's landingURL from Stage B IS the dedicated, hotel-specific,
+ * dated booking link — cid=<AGODA_SITE_ID> is already baked in by Agoda.
  */
 
 import { chat, type ChatMessage } from "./broker.js";
 import { findCity, type CityMatch } from "./agoda-city-lookup.js";
-import { searchHotelsByCity, type AgodaSearchResult } from "./agoda-api.js";
-import { getHotelsByIds, isAgodaDbAvailable } from "./agoda-db.js";
+import { searchHotelsByIds, type AgodaSearchResult } from "./agoda-api.js";
+import { searchHotelsByCityId, isAgodaDbAvailable, type HotelRow } from "./agoda-db.js";
 
-export interface SmartSearchParams {
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface LocalSearchParams {
   cityQuery: string;
   checkinDate: string; // YYYY-MM-DD
   checkoutDate: string; // YYYY-MM-DD
   adults?: number;
   children?: number;
   budgetMaxPerNight?: number;
-  starMin?: number;
-  reviewMin?: number;
-  preferenceText?: string; // free text: "near the beach", "quiet, close to MRT", etc.
+  preferenceText?: string; // free text: "near Thonglor", "close to the beach", etc.
   countryHint?: string | null; // ISO alpha-2 — narrows city name collisions
 }
 
 export interface HotelPick {
   hotelId: number;
   hotelName: string;
-  dailyRate: number;
-  currency: string;
-  starRating: number;
-  reviewScore: number;
-  landingURL: string;
+  address: string | null;
+  distanceKm: number | null; // real haversine distance to the geocoded preference, if any
+  approxRatePerNight: number | null; // CSV rates_from — static estimate, not live
+  currency: string | null;
+  starRating: number | null;
+  reviewScore: number | null; // CSV rating_average
   reasoning: string;
+  // Populated by fetchLiveAgodaPrices() — absent until Stage B runs
+  liveDailyRate?: number;
+  liveCurrency?: string;
+  liveDiscountPct?: number;
+  liveIncludeBreakfast?: boolean;
+  liveFreeWifi?: boolean;
+  landingURL?: string;
 }
 
-export interface SmartSearchResult {
+export interface LocalSearchResult {
   resolvedCity: CityMatch;
   candidateCount: number;
+  preferenceGeocoded: boolean;
   picks: HotelPick[];
 }
 
-function fallbackPicks(results: AgodaSearchResult[]): HotelPick[] {
-  return [...results]
-    .sort((a, b) => b.reviewScore - a.reviewScore)
-    .slice(0, 3)
-    .map((hotel) => ({
-      hotelId: hotel.hotelId,
-      hotelName: hotel.hotelName,
-      dailyRate: hotel.dailyRate,
-      currency: hotel.currency,
-      starRating: hotel.starRating,
-      reviewScore: hotel.reviewScore,
-      landingURL: hotel.landingURL,
-      reasoning: "Top-rated match for your dates (Kimi ranking unavailable — sorted by review score).",
-    }));
+// ---------------------------------------------------------------------------
+// Haversine distance
+// ---------------------------------------------------------------------------
+
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export async function smartSearchHotels(params: SmartSearchParams): Promise<SmartSearchResult | null> {
+// ---------------------------------------------------------------------------
+// Kimi-estimated geocoding — no external geocoding API, just the model's own
+// world knowledge. Less precise than a real geocoder, good enough for ranking.
+// ---------------------------------------------------------------------------
+
+interface Coords {
+  lat: number;
+  lon: number;
+}
+
+async function estimateCoordinates(placeName: string, cityName: string, country: string): Promise<Coords | null> {
+  const prompt: ChatMessage[] = [
+    {
+      role: "system",
+      content:
+        `You are a geography lookup engine. Given a district/neighbourhood/landmark name inside a city, ` +
+        `return your best estimate of its latitude and longitude from your own knowledge.\n\n` +
+        `Return ONLY valid JSON: { "lat": number, "lon": number } if you have reasonable confidence in ` +
+        `this specific place, or { "lat": null, "lon": null } if you don't recognise it. Do not guess wildly.`,
+    },
+    { role: "user", content: `Place: "${placeName}" in ${cityName}, ${country}` },
+  ];
+
+  try {
+    const raw = await chat(prompt, true);
+    const parsed = JSON.parse(raw) as { lat: number | null; lon: number | null };
+    if (typeof parsed.lat === "number" && typeof parsed.lon === "number") {
+      return { lat: parsed.lat, lon: parsed.lon };
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[agoda-search] coordinate estimate failed for "${placeName}":`, err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stage A — local DB search, no live API call
+// ---------------------------------------------------------------------------
+
+export async function searchLocalHotels(params: LocalSearchParams): Promise<LocalSearchResult | null> {
   const cityMatches = findCity(params.cityQuery, params.countryHint);
   if (cityMatches.length === 0) {
     console.warn(`[agoda-search] no city match for "${params.cityQuery}"`);
@@ -78,64 +132,78 @@ export async function smartSearchHotels(params: SmartSearchParams): Promise<Smar
   }
   const resolvedCity = cityMatches[0];
 
-  let results: AgodaSearchResult[];
-  try {
-    results = await searchHotelsByCity({
-      cityId: resolvedCity.city_id,
-      checkInDate: params.checkinDate,
-      checkOutDate: params.checkoutDate,
-      adults: params.adults ?? 2,
-      children: params.children ?? 0,
-      maxResult: 25,
-      sortBy: params.budgetMaxPerNight ? "PriceAsc" : "Recommended",
-      minimumStarRating: params.starMin ?? 0,
-      minimumReviewScore: params.reviewMin ?? 0,
-      dailyRateMax: params.budgetMaxPerNight,
-    });
-  } catch (err) {
-    console.error(`[agoda-search] API search failed:`, err instanceof Error ? err.message : err);
+  if (!isAgodaDbAvailable()) {
+    console.warn(`[agoda-search] local hotel DB unavailable — cannot run local search`);
     return null;
   }
 
-  if (results.length === 0) {
-    console.log(`[agoda-search] 0 results for ${resolvedCity.city} (${resolvedCity.city_id})`);
+  let rows = searchHotelsByCityId(resolvedCity.city_id, 500);
+  if (rows.length === 0) {
+    console.log(`[agoda-search] 0 local rows for ${resolvedCity.city} (${resolvedCity.city_id})`);
     return null;
   }
 
-  // Enrich with address/geo/overview from the local hotel DB — best effort,
-  // ranking still works from live API fields alone if the DB is unavailable.
-  const enrichment = isAgodaDbAvailable() ? getHotelsByIds(results.map((r) => r.hotelId)) : new Map();
+  // Budget filter — keep hotels with an unknown rate rather than drop them blind.
+  if (params.budgetMaxPerNight) {
+    const budget = params.budgetMaxPerNight;
+    rows = rows.filter((r) => r.rates_from === null || r.rates_from <= budget);
+  }
+  if (rows.length === 0) {
+    console.log(`[agoda-search] budget filter (<=${params.budgetMaxPerNight}) left 0 candidates`);
+    return null;
+  }
 
-  const candidates = results.map((r) => {
-    const extra = enrichment.get(r.hotelId);
-    return {
-      hotel_id: r.hotelId,
-      name: r.hotelName,
-      price_per_night: r.dailyRate,
-      currency: r.currency,
-      star_rating: r.starRating,
-      review_score: r.reviewScore,
-      discount_pct: r.discountPercentage ?? 0,
-      breakfast_included: r.includeBreakfast,
-      free_wifi: r.freeWifi,
-      address: extra?.address ?? null,
-      accommodation_type: extra?.accommodation_type ?? null,
-      description: extra?.overview ?? null,
-    };
-  });
+  // Distance filter/sort — only if we can geocode the stated preference.
+  let preferenceGeocoded = false;
+  let scored: Array<{ row: HotelRow; distanceKm: number | null }>;
+
+  if (params.preferenceText) {
+    const coords = await estimateCoordinates(params.preferenceText, resolvedCity.city, resolvedCity.country);
+    if (coords) {
+      preferenceGeocoded = true;
+      scored = rows
+        .filter((r) => r.latitude !== null && r.longitude !== null)
+        .map((row) => ({ row, distanceKm: haversineKm(coords.lat, coords.lon, row.latitude!, row.longitude!) }))
+        .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity))
+        .slice(0, 40);
+      console.log(
+        `[agoda-search] geocoded "${params.preferenceText}" -> ${coords.lat},${coords.lon} — ${scored.length} hotels scored by distance`
+      );
+    } else {
+      console.log(`[agoda-search] could not geocode "${params.preferenceText}" — ranking on text/rating only`);
+      scored = rows.slice(0, 40).map((row) => ({ row, distanceKm: null }));
+    }
+  } else {
+    scored = rows.slice(0, 40).map((row) => ({ row, distanceKm: null }));
+  }
+
+  const candidates = scored.map(({ row, distanceKm }) => ({
+    hotel_id: row.hotel_id,
+    name: row.hotel_name,
+    address: row.address,
+    distance_km: distanceKm !== null ? Math.round(distanceKm * 10) / 10 : null,
+    approx_rate_per_night: row.rates_from,
+    currency: row.rates_currency,
+    star_rating: row.star_rating,
+    rating_average: row.rating_average,
+    number_of_reviews: row.number_of_reviews,
+    accommodation_type: row.accommodation_type,
+    description: row.overview,
+  }));
 
   const rankingPrompt: ChatMessage[] = [
     {
       role: "system",
       content:
-        `You are a hotel-ranking engine for a travel concierge bot. You will be given a JSON list of ` +
-        `real, live, bookable hotel candidates (real prices, ratings, addresses, short descriptions) ` +
-        `plus a traveller's stated preferences. Pick the 3 best matches for this specific traveller and ` +
-        `explain each pick in one short, concrete sentence (mention the actual reason — price, location, ` +
-        `rating — don't be generic).\n\n` +
-        `Weigh price against budget_max_per_night if given, location/address hints against ` +
-        `traveller_preferences, star rating, and review score. Never invent hotels, prices, or facts not ` +
-        `present in the candidate list — only choose from the given hotel_id values.\n\n` +
+        `You are a hotel-ranking engine for a travel concierge bot. You'll get a JSON list of real hotel ` +
+        `candidates from our own hotel database (names, addresses, approximate rates, ratings, and — when ` +
+        `the traveller gave a location preference — a computed distance_km to that location) plus the ` +
+        `traveller's preferences. Pick the 3 best matches and explain each in one short, concrete sentence ` +
+        `(cite the actual reason: distance_km if present, price, rating — don't be generic).\n\n` +
+        `IMPORTANT: approx_rate_per_night is from static data and may be stale — treat it as a rough guide, ` +
+        `not a live price, and don't state it as a confirmed price. If distance_km is present for a ` +
+        `candidate, weigh it heavily against the traveller's stated location preference. Never invent ` +
+        `hotels or facts not in the list — only choose from the given hotel_id values.\n\n` +
         `Return ONLY valid JSON, no explanation:\n` +
         `{ "picks": [ { "hotel_id": number, "reasoning": string } ] } — EXACTLY 3 picks, best first.`,
     },
@@ -152,41 +220,99 @@ export async function smartSearchHotels(params: SmartSearchParams): Promise<Smar
     },
   ];
 
+  function toPick(row: HotelRow, distanceKm: number | null, reasoning: string): HotelPick {
+    return {
+      hotelId: row.hotel_id,
+      hotelName: row.hotel_name ?? `Hotel #${row.hotel_id}`,
+      address: row.address,
+      distanceKm,
+      approxRatePerNight: row.rates_from,
+      currency: row.rates_currency,
+      starRating: row.star_rating,
+      reviewScore: row.rating_average,
+      reasoning,
+    };
+  }
+
   let picks: HotelPick[] = [];
   try {
     const raw = await chat(rankingPrompt, true);
     const parsed = JSON.parse(raw) as { picks?: Array<{ hotel_id: number; reasoning: string }> };
-    const byId = new Map(results.map((r) => [r.hotelId, r]));
+    const byId = new Map(scored.map(({ row, distanceKm }) => [row.hotel_id, { row, distanceKm }]));
 
     picks = (parsed.picks ?? [])
       .map((p): HotelPick | null => {
-        const hotel = byId.get(Number(p.hotel_id));
-        if (!hotel) return null;
-        return {
-          hotelId: hotel.hotelId,
-          hotelName: hotel.hotelName,
-          dailyRate: hotel.dailyRate,
-          currency: hotel.currency,
-          starRating: hotel.starRating,
-          reviewScore: hotel.reviewScore,
-          landingURL: hotel.landingURL,
-          reasoning: p.reasoning,
-        };
+        const entry = byId.get(Number(p.hotel_id));
+        if (!entry) return null;
+        return toPick(entry.row, entry.distanceKm, p.reasoning);
       })
       .filter((p): p is HotelPick => p !== null)
       .slice(0, 3);
   } catch (err) {
-    console.warn(
-      `[agoda-search] Kimi ranking failed, falling back to top-3 by review score:`,
-      err instanceof Error ? err.message : err
-    );
+    console.warn(`[agoda-search] Kimi ranking failed, falling back to top rows:`, err instanceof Error ? err.message : err);
   }
 
-  if (picks.length === 0) picks = fallbackPicks(results);
+  if (picks.length === 0) {
+    picks = scored
+      .slice(0, 3)
+      .map(({ row, distanceKm }) =>
+        toPick(
+          row,
+          distanceKm,
+          distanceKm !== null
+            ? `Closest match to "${params.preferenceText}" among top-rated options.`
+            : "Top-rated option in the area."
+        )
+      );
+  }
 
   console.log(
-    `[agoda-search] ${resolvedCity.city} (${resolvedCity.city_id}): ${results.length} candidates -> ${picks.length} picks`
+    `[agoda-search] ${resolvedCity.city} (${resolvedCity.city_id}): ${rows.length} local candidates -> ${picks.length} picks (geocoded=${preferenceGeocoded})`
   );
 
-  return { resolvedCity, candidateCount: results.length, picks };
+  return { resolvedCity, candidateCount: rows.length, preferenceGeocoded, picks };
+}
+
+// ---------------------------------------------------------------------------
+// Stage B — live Agoda pricing for the Stage A picks. Only call this when the
+// user explicitly asks for real-time prices, or the booking link (which
+// needs live data regardless).
+// ---------------------------------------------------------------------------
+
+export async function fetchLiveAgodaPrices(
+  picks: HotelPick[],
+  params: { checkinDate: string; checkoutDate: string; adults?: number; children?: number }
+): Promise<HotelPick[]> {
+  if (picks.length === 0) return picks;
+
+  let live: AgodaSearchResult[];
+  try {
+    live = await searchHotelsByIds({
+      hotelIds: picks.map((p) => p.hotelId),
+      checkInDate: params.checkinDate,
+      checkOutDate: params.checkoutDate,
+      adults: params.adults ?? 2,
+      children: params.children ?? 0,
+    });
+  } catch (err) {
+    console.error(`[agoda-search] live price fetch failed:`, err instanceof Error ? err.message : err);
+    return picks;
+  }
+
+  console.log(`[agoda-search] Stage B: fetched live prices for ${live.length}/${picks.length} picks`);
+
+  const byId = new Map(live.map((r) => [r.hotelId, r]));
+  return picks.map((pick) => {
+    const l = byId.get(pick.hotelId);
+    if (!l) return pick;
+    return {
+      ...pick,
+      liveDailyRate: l.dailyRate,
+      liveCurrency: l.currency,
+      liveDiscountPct: l.discountPercentage,
+      liveIncludeBreakfast: l.includeBreakfast,
+      liveFreeWifi: l.freeWifi,
+      landingURL: l.landingURL,
+    };
+  });
 }

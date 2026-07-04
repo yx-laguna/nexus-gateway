@@ -26,7 +26,7 @@ import {
   type MintedLink,
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
-import { smartSearchHotels, type SmartSearchResult } from "./agoda-search.js";
+import { searchLocalHotels, fetchLiveAgodaPrices, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,18 @@ import { z } from "zod";
 // ---------------------------------------------------------------------------
 
 const sessions = new Map<number, ChatMessage[]>();
+
+// Remembers each user's last hotel search (Stage A local picks + the search
+// params used) so a later "check real prices for these" doesn't need the
+// user to repeat the city/dates — Stage B just needs the hotel IDs.
+interface StoredHotelSearch {
+  result: LocalSearchResult;
+  checkinDate: string;
+  checkoutDate: string;
+  adults: number;
+  children: number;
+}
+const lastHotelSearch = new Map<number, StoredHotelSearch>();
 
 // ---------------------------------------------------------------------------
 // System prompt — concierge-first, USDC as a footnote
@@ -50,6 +62,8 @@ Conversational, warm, knowledgeable — like a friend who knows all the best dea
 - Shopping: item/category is enough. Budget optional.
 - If the user gave you info already — use it, don't ask again.
 - Don't mention rebates or links until the user shows clear purchase intent.
+- Hotel prices you show at first are database estimates, not live prices. If the user seems to
+  want exact current pricing, mention they can ask you to "check real-time prices."
 
 ## Purchase intent signals (system will then send links)
 Only an explicit request for the link itself counts — e.g. "give me the link to book", "send me
@@ -118,6 +132,12 @@ const GoalIntentSchema = z.object({
    * false = user is browsing/exploring — show options but don't mint links yet
    */
   purchase_ready: z.boolean().default(false),
+  /**
+   * true = user explicitly asked to check/search real-time or live prices for hotels
+   * already discussed (distinct from purchase_ready — this doesn't ask for the booking
+   * link, just current prices). false = keep showing the static database estimate.
+   */
+  wants_realtime_prices: z.boolean().default(false),
   // ── Hotel-search fields (only meaningful when a "hotel"-type category is present) ──
   // Populated opportunistically from anywhere in the conversation — null if not mentioned yet.
   // destination_city MUST be just the city/place name (e.g. "Bangkok") — never a full sentence,
@@ -175,8 +195,15 @@ explicitly ask for the link. When in doubt, default to false.
 - "checkin_date" / "checkout_date": absolute YYYY-MM-DD, resolved from whatever the user said relative to today (${todayISO}). Null if no dates mentioned at all — do NOT guess dates the user never implied.
 - "adults" / "children": default adults=2, children=0 if travel party size isn't mentioned.
 - "budget_max_per_night": a number if the user gave any per-night/total budget hint, else null.
-- "hotel_preference_text": short free text capturing what the traveller cares about for THIS hotel search — location/distance cues ("near the beach", "walkable to downtown", "close to the conference venue"), vibe, must-have amenities. Null if nothing beyond price/stars was said.
+- "hotel_preference_text": capture ANY location/proximity cue LITERALLY, keeping the actual place name intact — e.g. "near Thonglor" not "nightlife area", "close to Marina Bay Sands" not "near the water". This gets geocoded downstream, so a specific real name matters far more than a vibe description. If there's no location cue, other preferences (vibe, must-have amenities) are fine here too. Null if nothing beyond price/stars was said.
 - If destination_city, checkin_date, or checkout_date is missing for a hotel search, set needs_clarification: true and ask for whichever is missing in clarification_question — but still fill in categories/recommendations from what you know so the user gets a useful reply either way.
+
+## wants_realtime_prices detection (separate from purchase_ready)
+Set wants_realtime_prices: true if the user asks to check/search/confirm CURRENT or LIVE prices
+for hotels already shown — e.g. "search realtime for these", "check real prices", "what are the
+actual current rates", "get live prices for these 3", "use the agoda api to check prices". This
+is about wanting up-to-date pricing, NOT about wanting the booking link — someone can want live
+prices without being purchase_ready, and vice versa. Default false.
 
 ## Output — ONLY valid JSON, no explanation:
 {
@@ -194,6 +221,7 @@ explicitly ask for the link. When in doubt, default to false.
   "is_dashboard_query": bool,
   "is_off_topic": bool,
   "purchase_ready": bool,
+  "wants_realtime_prices": bool,
   "destination_city": string|null,
   "checkin_date": string|null,
   "checkout_date": string|null,
@@ -249,6 +277,7 @@ Max 4 categories. Output JSON only.`,
       is_off_topic: false,
       needs_clarification: false,
       purchase_ready: false,
+      wants_realtime_prices: false,
     };
   }
 }
@@ -274,15 +303,17 @@ export interface EnrichedCategory {
   acpJob?: Promise<MintedLink>;
   // Extra platforms minted in parallel (e.g. agoda alongside trip-com for hotels)
   extraPlatforms?: PlatformJob[];
-  // Real, live, Kimi-ranked Agoda hotel picks (hotel categories only — see agoda-search.ts).
-  // Independent of the Laguna/ACP mint above: this is real search + a dedicated booking
-  // URL per hotel, not a generic merchant homepage link.
-  agodaSmart?: SmartSearchResult;
+  // Real, Kimi-ranked hotel picks from our own hotel DB (hotel categories only — see
+  // agoda-search.ts). Independent of the Laguna/ACP mint above: this is a grounded local
+  // search that only gets real-time prices/landingURL once Stage B (fetchLiveAgodaPrices)
+  // has run — either on explicit request or because purchase_ready needs the booking link.
+  agodaSmart?: LocalSearchResult;
 }
 
 async function runTools(
   intent: GoalIntent,
   walletAddress: string,
+  userId: number,
   mintLinks: boolean = true
 ): Promise<EnrichedCategory[]> {
   // For each category label, an ordered list of Laguna merchant slugs to try.
@@ -370,15 +401,18 @@ async function runTools(
       const isHotel = HOTEL_RE.test(cat.label);
       console.log(`[agent] category "${cat.label}" isHotel=${isHotel} — trying platforms:`, platforms);
 
-      // For hotels: always mint BOTH trip-com and agoda in parallel, AND (new) run a
-      // real Agoda inventory search + Kimi ranking alongside it whenever we have
-      // enough info (destination + dates) to actually search.
+      // For hotels: always mint BOTH trip-com and agoda in parallel, AND (new) run our own
+      // local hotel search + Kimi ranking alongside it whenever we have enough info
+      // (destination + dates) — Stage A, no live API call, blended into every reply.
+      // Live Agoda pricing (Stage B) only happens on explicit request — see below.
       if (isHotel) {
         // destination_city is a clean place name from the LLM (e.g. "Bangkok") — required for
         // an exact-match city lookup. cat.label/intent.goal are full sentences and never match.
-        const canSmartSearch = !!(intent.destination_city && intent.checkin_date && intent.checkout_date);
-        const smartSearchPromise = canSmartSearch
-          ? smartSearchHotels({
+        const canSearch = !!(intent.destination_city && intent.checkin_date && intent.checkout_date);
+        const stored = lastHotelSearch.get(userId);
+
+        const localSearchPromise: Promise<LocalSearchResult | null> = canSearch
+          ? searchLocalHotels({
               cityQuery: intent.destination_city!,
               checkinDate: intent.checkin_date!,
               checkoutDate: intent.checkout_date!,
@@ -388,20 +422,57 @@ async function runTools(
               preferenceText: intent.hotel_preference_text ?? undefined,
               countryHint: intent.geo,
             }).catch((err) => {
-              console.error(`[agent] smartSearchHotels failed:`, err instanceof Error ? err.message : err);
+              console.error(`[agent] searchLocalHotels failed:`, err instanceof Error ? err.message : err);
               return null;
             })
-          : Promise.resolve(null);
+          // No fresh destination/dates this turn — if the user's asking about prices/the
+          // link for hotels we already found, reuse that search instead of coming up empty.
+          : Promise.resolve((intent.wants_realtime_prices || mintLinks) && stored ? stored.result : null);
 
-        const [tripResult, agodaResult, smartSearchResult] = await Promise.allSettled([
+        const [tripResult, agodaResult, localSearchResult] = await Promise.allSettled([
           resolveMerchant("trip-com", intent.geo),
           resolveMerchant("agoda", intent.geo),
-          smartSearchPromise,
+          localSearchPromise,
         ]);
 
         const trip = tripResult.status === "fulfilled" ? tripResult.value : null;
         const agoda = agodaResult.status === "fulfilled" ? agodaResult.value : null;
-        const agodaSmart = smartSearchResult.status === "fulfilled" ? smartSearchResult.value ?? undefined : undefined;
+        let agodaSmart = localSearchResult.status === "fulfilled" ? localSearchResult.value ?? undefined : undefined;
+
+        // Stage B — live Agoda pricing — only when explicitly asked for real-time prices,
+        // or purchase_ready needs live data to produce a real booking link.
+        if (agodaSmart && (intent.wants_realtime_prices || mintLinks)) {
+          const ci = intent.checkin_date ?? stored?.checkinDate;
+          const co = intent.checkout_date ?? stored?.checkoutDate;
+          if (ci && co) {
+            try {
+              const livePicks = await fetchLiveAgodaPrices(agodaSmart.picks, {
+                checkinDate: ci,
+                checkoutDate: co,
+                adults: intent.adults ?? stored?.adults ?? 2,
+                children: intent.children ?? stored?.children ?? 0,
+              });
+              agodaSmart = { ...agodaSmart, picks: livePicks };
+            } catch (err) {
+              console.error(`[agent] fetchLiveAgodaPrices failed:`, err instanceof Error ? err.message : err);
+            }
+          }
+        }
+
+        // Remember this search (with whatever live data we now have) for a later turn.
+        if (agodaSmart) {
+          const ci = intent.checkin_date ?? stored?.checkinDate;
+          const co = intent.checkout_date ?? stored?.checkoutDate;
+          if (ci && co) {
+            lastHotelSearch.set(userId, {
+              result: agodaSmart,
+              checkinDate: ci,
+              checkoutDate: co,
+              adults: intent.adults ?? stored?.adults ?? 2,
+              children: intent.children ?? stored?.children ?? 0,
+            });
+          }
+        }
 
         if (!trip && !agoda && !agodaSmart) throw new Error(`No hotel merchants available for ${cat.label}`);
 
@@ -630,13 +701,24 @@ function buildReply(
     const agodaPicks = matched?.agodaSmart?.picks ?? [];
     const recs = cat.recommendations.slice(0, 3);
 
+    let anyLivePrice = false;
+
     if (agodaPicks.length > 0) {
-      // Real, live, Kimi-ranked Agoda inventory — grounded facts, not LLM guesses.
+      // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
+      // either a live Agoda price (Stage B has run) or a static database estimate.
       agodaPicks.forEach((pick, i) => {
-        lines.push(
-          `${i + 1}. *${pick.hotelName}* — ${pick.reasoning} · ~${pick.currency} ${pick.dailyRate.toFixed(0)}/night ` +
-          `(★${pick.starRating} · ${pick.reviewScore}/10)`
-        );
+        const distanceStr = pick.distanceKm !== null ? ` · ${pick.distanceKm}km away` : "";
+        let priceStr: string;
+        if (pick.liveDailyRate !== undefined) {
+          anyLivePrice = true;
+          priceStr = `${pick.liveCurrency ?? pick.currency ?? "USD"} ${pick.liveDailyRate.toFixed(0)}/night (live)`;
+        } else if (pick.approxRatePerNight !== null) {
+          priceStr = `~${pick.currency ?? "USD"} ${pick.approxRatePerNight.toFixed(0)}/night (est.)`;
+        } else {
+          priceStr = "price on request";
+        }
+        const ratingStr = pick.starRating ? ` (★${pick.starRating}${pick.reviewScore ? ` · ${pick.reviewScore}/10` : ""})` : "";
+        lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning} · ${priceStr}${distanceStr}${ratingStr}`);
       });
     } else {
       // Fall back to Step 1's LLM-knowledge recommendations (no real search data yet —
@@ -651,7 +733,14 @@ function buildReply(
     // everything else in this bot.
     if (agodaPicks.length > 0 && purchaseReady) {
       const top = agodaPicks[0];
-      lines.push(`→ Book *${top.hotelName}* directly on Agoda: ${top.landingURL}`);
+      if (top.landingURL) {
+        lines.push(`→ Book *${top.hotelName}* directly on Agoda: ${top.landingURL}`);
+      } else {
+        lines.push(`→ Couldn't confirm a live booking link for *${top.hotelName}* just now — try again in a moment.`);
+      }
+    } else if (agodaPicks.length > 0 && !anyLivePrice) {
+      // Static estimates only — let the user know they can ask for the real thing.
+      lines.push(`_Prices above are database estimates — ask me to "check real-time prices" for exact numbers._`);
     }
 
     // Generic Laguna/ACP merchant line — only when an actual merchant was resolved
@@ -824,7 +913,7 @@ async function _processMessage(
     } else if (hasCategories) {
       const purchaseReady = intent.purchase_ready ?? false;
       console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"} | purchase_ready=${purchaseReady}`);
-      const enriched = await runTools(intent, walletAddress, purchaseReady);
+      const enriched = await runTools(intent, walletAddress, userId, purchaseReady);
       reply = buildReply(intent, enriched, !!walletAddress, userCountry, purchaseReady);
 
       // For each ACP job in flight, send follow-up when it settles
