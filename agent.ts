@@ -1155,8 +1155,10 @@ function buildReply(
       lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
     } else if (chosenProductPick) {
       anyProductChosenThisTurn = true;
-      // Mirrors the hotel branch: confirm here, actual link (minted via ACP where possible,
-      // see buildProductLinkMessage) arrives as its own separate follow-up message.
+      // Direct link policy (2026-07-05): Shopee/iHerb have no ACP mint path worth taking
+      // (no live affiliate program / no bridge special case yet), so show the raw
+      // productUrl straight from our own catalog instead of deferring to a mint-then-
+      // follow-up message.
       const price = chosenProductPick.salePrice ?? chosenProductPick.price;
       let priceStr = "";
       if (price !== null) {
@@ -1164,7 +1166,8 @@ function buildReply(
           chosenProductPick.salePrice !== null && chosenProductPick.price !== null && chosenProductPick.salePrice < chosenProductPick.price;
         priceStr = ` · ${chosenProductPick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${chosenProductPick.currency ?? ""} ${chosenProductPick.price!.toFixed(2)})` : ""}`;
       }
-      lines.push(`Got it — *${chosenProductPick.title}*${priceStr}. Sending the link next! 🔗`);
+      lines.push(`Got it — *${chosenProductPick.title}*${priceStr}. Here's the direct link:`);
+      lines.push(chosenProductPick.productUrl ?? "_(no direct link on file for this one — sorry!)_");
     } else if (productPicks.length > 0) {
       // Real Shopee/iHerb picks from our own catalog — grounded facts, not LLM guesses.
       // Raw product_url shown directly (no ACP mint / affiliate wrapping yet — discovery
@@ -1280,17 +1283,23 @@ function buildReply(
 // top-ranked pick if the traveller never singled one out. Returns null when there's
 // nothing purchase-ready to show yet, or no link is actually available.
 //
-// Before handing back chosen.landingURL as-is, routes it through the ACP bridge's
-// mint_link offering (merchant_id="agoda", target_url=chosen.landingURL) so the deep-link
-// wrapping (Involve Asia under the hood) and wallet-level cashback tracking both happen at
-// the ACP Laguna layer — one unified path so cashback checking/withdrawal-by-agents works
-// the same way for hotels as for every other merchant. Falls back to the raw landingURL on
-// any failure — a working link always beats no link.
+// Explicit policy (2026-07-05): Agoda gets a DIRECT link, no ACP mint_link call at all.
+// chosen.landingURL already comes from Yixin's own Agoda Affiliate Long Tail Search API
+// (AGODA_SITE_ID baked in server-side — see agoda-api.ts/agoda-search.ts), which means it's
+// ALREADY a real, wallet-independent, commission-tracked affiliate link on its own — no
+// Involve Asia/ACP round-trip needed on top of it for cashback attribution to work. This
+// also sidesteps an entire class of bugs the ACP path went through today (target_url never
+// actually being forwarded to the job, Telegram Markdown delivery failures, a 404'd
+// shortlink) in favor of something simpler and already proven to work. Shopee/iHerb
+// (buildReply's chosenProductPick branch) follow the same direct-link policy — see there for
+// why. Laguna's generic ACP mint_link stays in use for every OTHER merchant (Trip.com, and
+// anything resolved via the generic Laguna-merchant-search fallback) where we don't have our
+// own affiliate-tracked link to hand back directly.
 async function buildBookingLinkMessage(
   intent: GoalIntent,
   enriched: EnrichedCategory[],
   purchaseReady: boolean,
-  walletAddress: string
+  _walletAddress: string
 ): Promise<string | null> {
   if (!purchaseReady) return null;
 
@@ -1305,85 +1314,19 @@ async function buildBookingLinkMessage(
       (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined) ??
       (agodaPicks.length > 0 ? agodaPicks[0] : undefined);
     if (chosen?.landingURL) {
-      let bookingUrl = chosen.landingURL;
-      try {
-        const minted = await acpMintLink({
-          merchant_id: "agoda",
-          target_url: chosen.landingURL,
-          geo: intent.geo,
-          caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
-          wallet_address: walletAddress || undefined,
-        });
-        if (minted.shortlink) bookingUrl = minted.shortlink;
-      } catch (err) {
-        console.error(`[agent] ACP mint_link failed for agoda deep link, falling back to raw landingURL:`, err instanceof Error ? err.message : err);
-      }
-      lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${bookingUrl}`);
+      lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${chosen.landingURL}`);
     }
   }
 
   return lines.length > 0 ? lines.join("\n\n") : null;
 }
 
-// Builds the ACP-minted link for whichever product the shopper has singled out this turn
-// (chosen_product_text -> chosenProductKey/chosenProductOverride, same resolution as
-// buildReply's chosenProductPick) — sent as its own follow-up message, mirroring
-// buildBookingLinkMessage's pattern for hotels. Deliberately NOT gated on purchase_ready:
-// naming a product keeps purchase_ready:false for retail by design (see extractIntent's
-// prompt), but the shopper still wants a real link the moment they name something.
-//
-// Explicit user request (2026-07-05): mint via the same generic ACP mint_link path every
-// other merchant uses — NOT an Involve Asia call (Shopee isn't set up as an Involve Asia
-// offer yet). CAVEAT carried over from earlier research: Laguna's own "shopee" merchant was
-// found to route through an unrelated ad network (chinesean.com) that ignored geo/target_url
-// in testing — so this mint may not actually come back pointed at this exact product. Falls
-// back to the raw, definitely-correct product_url on any mint failure or if the merchant
-// isn't recognised — a link that's certain to work beats one that might not — and labels
-// which case happened so it's obvious from the reply alone, not just the logs.
-async function buildProductLinkMessage(
-  intent: GoalIntent,
-  enriched: EnrichedCategory[],
-  walletAddress: string
-): Promise<string | null> {
-  const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
-  const lines: string[] = [];
-
-  for (const cat of intent.categories.slice(0, 4)) {
-    const matched = enrichedByLabel.get(cat.label);
-    const productPicks = matched?.productSearch?.picks ?? [];
-    const chosen =
-      matched?.chosenProductOverride ??
-      (matched?.chosenProductKey != null
-        ? productPicks.find((p) => `${p.merchant}:${p.productId}` === matched.chosenProductKey)
-        : undefined);
-    if (!chosen?.productUrl) continue;
-
-    let link = chosen.productUrl;
-    let mintedOk = false;
-    try {
-      const minted = await acpMintLink({
-        merchant_id: chosen.merchant,
-        target_url: chosen.productUrl,
-        geo: intent.geo,
-        caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
-        wallet_address: walletAddress || undefined,
-      });
-      if (minted.shortlink) {
-        link = minted.shortlink;
-        mintedOk = true;
-      }
-    } catch (err) {
-      console.error(`[agent] ACP mint_link failed for ${chosen.merchant} product, falling back to raw product_url:`, err instanceof Error ? err.message : err);
-    }
-    lines.push(
-      mintedOk
-        ? `→ *${chosen.title}*: ${link}`
-        : `→ *${chosen.title}* (mint unavailable for ${chosen.merchant} right now — here's the direct link instead): ${link}`
-    );
-  }
-
-  return lines.length > 0 ? lines.join("\n\n") : null;
-}
+// REMOVED (2026-07-05): buildProductLinkMessage/ACP mint for Shopee/iHerb products, per the
+// same direct-link policy as Agoda above (plus iHerb specifically has no ACP bridge special
+// case yet, and Shopee has no live affiliate program at all — an ACP mint attempt for either
+// was never going to land on a real, product-specific tracked link). buildReply's
+// chosenProductPick branch now shows chosen.productUrl directly instead of deferring to a
+// separate mint-then-follow-up message.
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -1512,26 +1455,16 @@ async function _processMessage(
         }
 
         // Dedicated Agoda booking link, sent as its OWN separate message rather than
-        // bundled into the reply above — per explicit request. Now involves a real
-        // network call (Involve Asia deeplink wrap, see buildBookingLinkMessage), so it
-        // naturally resolves after the synchronous main reply below rather than needing
-        // an artificial delay.
+        // bundled into the reply above — per explicit request. Direct link now (no ACP
+        // mint, see buildBookingLinkMessage's comment), so this resolves essentially
+        // instantly, but stays a separate follow-up message for the same UX reason as
+        // before.
         buildBookingLinkMessage(intent, enriched, purchaseReady, walletAddress)
           .then((bookingLinkMsg) => {
             if (bookingLinkMsg) return onFollowUp(bookingLinkMsg);
           })
           .catch((err) => {
             console.error(`[agent] booking-link follow-up failed:`, err instanceof Error ? err.message : err);
-          });
-
-        // Same idea for a singled-out product — not gated on purchase_ready (see
-        // buildProductLinkMessage's comment for why).
-        buildProductLinkMessage(intent, enriched, walletAddress)
-          .then((productLinkMsg) => {
-            if (productLinkMsg) return onFollowUp(productLinkMsg);
-          })
-          .catch((err) => {
-            console.error(`[agent] product-link follow-up failed:`, err instanceof Error ? err.message : err);
           });
       }
 
