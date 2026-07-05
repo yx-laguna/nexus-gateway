@@ -59,6 +59,8 @@ interface StoredHotelSearch {
   children: number;
   preferenceText?: string;
   budgetMaxPerNight?: number;
+  budgetMinPerNight?: number;
+  wantsLuxury?: boolean;
   // Which of result.picks the traveller has singled out (by name, resolved from
   // chosen_hotel_text) — so the booking link, once asked for, matches what they actually
   // chose instead of always the top-ranked pick. Cleared whenever a genuinely fresh
@@ -175,6 +177,14 @@ const GoalIntentSchema = z.object({
    */
   wants_different_hotels: z.boolean().default(false),
   /**
+   * true = user explicitly wants MORE EXPENSIVE/premium options — "more luxurious",
+   * "something nicer", "high-end", "5-star", "upscale". Distinct from budget_min_per_night
+   * (an explicit number): this fires even without a number, and signals that star_rating
+   * should drive ranking/candidate selection rather than a hotel's own descriptive text or
+   * free-form LLM judgment (a 2-star budget hotel can still read as "nice" in prose).
+   */
+  wants_luxury: z.boolean().default(false),
+  /**
    * Free text naming/identifying WHICH of the shown hotel options the traveller means —
    * e.g. "the Grand Hyatt", "YOTEL", "the second one" (resolved to that hotel's name using
    * conversation history). Filled whenever they express a preference/decision, independent
@@ -194,6 +204,10 @@ const GoalIntentSchema = z.object({
   adults: z.number().int().min(1).max(20).nullish(),
   children: z.number().int().min(0).max(10).nullish(),
   budget_max_per_night: z.number().positive().nullish(),
+  // A stated MINIMUM per-night price — "above $200", "at least $150/night", "$200+",
+  // "over $300 a night". The mirror image of budget_max_per_night: enforced as a real
+  // floor against static AND live prices, not just left to Kimi's judgment.
+  budget_min_per_night: z.number().positive().nullish(),
   // Free text describing what matters to the traveller for hotel choice —
   // location/distance, vibe, amenities — passed to Kimi for ranking, not a fixed filter.
   hotel_preference_text: z.string().nullish(),
@@ -239,7 +253,8 @@ explicitly ask for the link. When in doubt, default to false.
 - "destination_city": ONLY the city or place name the hotel search is for — e.g. "Bangkok", "Singapore", "New York". NEVER a full sentence, NEVER a neighbourhood-only value, NEVER the category label. This is looked up in an exact city database, so it must be just the place name a city lookup would recognise. Null if no destination is clear yet.
 - "checkin_date" / "checkout_date": absolute YYYY-MM-DD, resolved from whatever the user said relative to today (${todayISO}). Null if no dates mentioned at all — do NOT guess dates the user never implied.
 - "adults" / "children": default adults=2, children=0 if travel party size isn't mentioned.
-- "budget_max_per_night": a number if the user gave any per-night/total budget hint, else null.
+- "budget_max_per_night": a number if the user gave any per-night/total MAXIMUM budget hint ("under $100", "budget of $150", "no more than $200"), else null.
+- "budget_min_per_night": a number if the user gave any per-night MINIMUM price floor ("above $200", "at least $150", "$200+", "over $300 a night", "something pricier than that"), else null. This is the opposite direction from budget_max_per_night — never fill both from the same phrase.
 - "hotel_preference_text": capture ANY location/proximity cue LITERALLY, keeping the actual place name intact — e.g. "near Thonglor" not "nightlife area", "close to Marina Bay Sands" not "near the water". This gets geocoded downstream, so a specific real name matters far more than a vibe description. If there's no location cue, other preferences (vibe, must-have amenities) are fine here too. Null if nothing beyond price/stars was said.
 - If destination_city, checkin_date, or checkout_date is missing for a hotel search, set needs_clarification: true and ask for whichever is missing in clarification_question — but still fill in categories/recommendations from what you know so the user gets a useful reply either way.
 
@@ -258,6 +273,15 @@ these work, try again". This is distinct from wants_realtime_prices (which is ab
 hotels, just needing current pricing) and from a genuinely new search (new city/dates/location
 preference stated) — this is specifically "not these ones, something different, same criteria
 otherwise". Default false.
+
+## wants_luxury detection
+Set wants_luxury: true if the user asks for something MORE EXPENSIVE/upscale than what was
+shown — "I want something more luxurious", "give me nicer options", "something high-end",
+"more premium", "5-star only", "upscale". This can fire with or without a specific number —
+if they also gave a number ("above $200 if possible"), fill budget_min_per_night too. This
+matters because star_rating (not a hotel's own marketing text or vibe) is what actually
+determines luxury-tier ranking downstream — flag it explicitly rather than relying on the
+hotel_preference_text free text alone. Default false.
 
 ## chosen_hotel_text detection
 Whenever the traveller singles out ONE specific hotel from the options already shown — deciding
@@ -287,6 +311,7 @@ still be remembered when they do. Null if no single hotel has been singled out t
   "purchase_ready": bool,
   "wants_realtime_prices": bool,
   "wants_different_hotels": bool,
+  "wants_luxury": bool,
   "chosen_hotel_text": string|null,
   "destination_city": string|null,
   "checkin_date": string|null,
@@ -294,6 +319,7 @@ still be remembered when they do. Null if no single hotel has been singled out t
   "adults": number|null,
   "children": number|null,
   "budget_max_per_night": number|null,
+  "budget_min_per_night": number|null,
   "hotel_preference_text": string|null
 }
 
@@ -345,6 +371,7 @@ Max 4 categories. Output JSON only.`,
       purchase_ready: false,
       wants_realtime_prices: false,
       wants_different_hotels: false,
+      wants_luxury: false,
     };
   }
 }
@@ -505,10 +532,23 @@ async function runTools(
           !!intent.hotel_preference_text && intent.hotel_preference_text !== stored?.preferenceText;
         const budgetChanged =
           intent.budget_max_per_night != null && intent.budget_max_per_night !== stored?.budgetMaxPerNight;
+        const minBudgetChanged =
+          intent.budget_min_per_night != null && intent.budget_min_per_night !== stored?.budgetMinPerNight;
+        // wants_luxury is a one-way trigger, same idea as wants_different_hotels — the
+        // traveller saying "more luxurious" is itself a signal to re-search even if
+        // nothing else changed, since it should re-sort candidates by star_rating.
+        const luxuryChanged = intent.wants_luxury && !stored?.wantsLuxury;
 
         const shouldSearch =
           canSearch &&
-          (!stored || cityChanged || datesChanged || preferenceChanged || budgetChanged || intent.wants_different_hotels);
+          (!stored ||
+            cityChanged ||
+            datesChanged ||
+            preferenceChanged ||
+            budgetChanged ||
+            minBudgetChanged ||
+            luxuryChanged ||
+            intent.wants_different_hotels);
 
         const localSearchPromise: Promise<LocalSearchResult | null> = shouldSearch
           ? searchLocalHotels({
@@ -518,6 +558,8 @@ async function runTools(
               adults: intent.adults ?? stored?.adults ?? 2,
               children: intent.children ?? stored?.children ?? 0,
               budgetMaxPerNight: (intent.budget_max_per_night ?? stored?.budgetMaxPerNight) ?? undefined,
+              budgetMinPerNight: (intent.budget_min_per_night ?? stored?.budgetMinPerNight) ?? undefined,
+              wantsLuxury: intent.wants_luxury || stored?.wantsLuxury || false,
               preferenceText: (intent.hotel_preference_text ?? stored?.preferenceText) ?? undefined,
               countryHint: intent.geo,
               // Only exclude previously-shown hotels when the user explicitly asked for
@@ -627,6 +669,8 @@ async function runTools(
               children: intent.children ?? stored?.children ?? 0,
               preferenceText: (intent.hotel_preference_text ?? stored?.preferenceText) ?? undefined,
               budgetMaxPerNight: (intent.budget_max_per_night ?? stored?.budgetMaxPerNight) ?? undefined,
+              budgetMinPerNight: (intent.budget_min_per_night ?? stored?.budgetMinPerNight) ?? undefined,
+              wantsLuxury: intent.wants_luxury || stored?.wantsLuxury || false,
               chosenHotelId,
               chosenHotelOverride,
             });

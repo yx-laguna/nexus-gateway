@@ -74,6 +74,15 @@ export interface LocalSearchParams {
   adults?: number;
   children?: number;
   budgetMaxPerNight?: number;
+  // A stated MINIMUM per-night price — the mirror of budgetMaxPerNight. Enforced as a
+  // real floor against both the static rate and the live price, same treatment as the max.
+  budgetMinPerNight?: number;
+  // "More luxurious", "something nicer", "5-star only" — with or without a specific
+  // number. When set, star_rating becomes the PRIMARY candidate-selection/sort signal
+  // instead of a hotel's own descriptive text or free-form LLM judgment (see the
+  // star-rating sort below) — a 2-star budget hotel can otherwise still read as "nice"
+  // in prose and get picked by distance-only ranking.
+  wantsLuxury?: boolean;
   preferenceText?: string; // free text: "near Thonglor", "close to the beach", etc.
   countryHint?: string | null; // ISO alpha-2 — narrows city name collisions
   // Hotel IDs to leave out of the candidate pool entirely — used when the traveller
@@ -273,6 +282,17 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
     return null;
   }
 
+  // Minimum-price filter — the mirror of the max-budget filter above. Same null-rate
+  // leniency (don't drop a hotel blind just because its static rate is unknown).
+  if (params.budgetMinPerNight) {
+    const minBudget = params.budgetMinPerNight;
+    rows = rows.filter((r) => r.rates_from === null || r.rates_from >= minBudget);
+  }
+  if (rows.length === 0) {
+    console.log(`[agoda-search] minimum-price filter (>=${params.budgetMinPerNight}) left 0 candidates`);
+    return null;
+  }
+
   // Distance filter/sort — only if we can geocode the stated preference.
   let preferenceGeocoded = false;
   let scored: Array<{ row: HotelRow; distanceKm: number | null }>;
@@ -294,6 +314,20 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
     }
   } else {
     scored = rows.map((row) => ({ row, distanceKm: null }));
+  }
+
+  // Luxury signal — real bug: a traveller asked for "more luxurious, above $200" and
+  // still got a 2-star $33/night hotel back, because the backfill/swap logic (further
+  // below) just grabs the next-closest untried candidate with zero star_rating
+  // awareness. star_rating is a far more reliable "luxury" signal than trusting a
+  // hotel's own descriptive text or Kimi's free-form judgment of it, so when the
+  // traveller explicitly wants premium options (wantsLuxury, or gave a minimum price
+  // floor as an implicit signal of the same), make star_rating the PRIMARY sort key —
+  // applied as a stable sort AFTER the distance sort above, so distance still breaks
+  // ties among equally-starred hotels, but star_rating now dominates the order that both
+  // Kimi's initial ranking pool AND every backfill swap draw from.
+  if (params.wantsLuxury || params.budgetMinPerNight != null) {
+    scored = [...scored].sort((a, b) => (b.row.star_rating ?? 0) - (a.row.star_rating ?? 0));
   }
 
   // When a budget is specified, a hotel with a known static rate (already confirmed <=
@@ -336,6 +370,14 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
         `not a live price, and don't state it as a confirmed price. If distance_km is present for a ` +
         `candidate, weigh it heavily against the traveller's stated location preference. Never invent ` +
         `hotels or facts not in the list — only choose from the given hotel_id values.\n\n` +
+        (params.wantsLuxury || params.budgetMinPerNight != null
+          ? `LUXURY REQUEST: the traveller explicitly wants more expensive/premium options` +
+            (params.budgetMinPerNight != null ? ` (minimum ${params.budgetMinPerNight}/night)` : "") +
+            `. star_rating is the ONLY reliable signal for this — a hotel's name or description text is ` +
+            `NOT evidence of luxury. Strongly prefer the highest star_rating candidates (5-star, then ` +
+            `4.5-star) and do not pick anything below 4 stars unless nothing higher exists in the list. ` +
+            `Never call a hotel "luxurious" in your reasoning unless its star_rating actually supports it.\n\n`
+          : "") +
         `Return ONLY valid JSON, no explanation:\n` +
         `{ "picks": [ { "hotel_id": number, "reasoning": string } ] } — EXACTLY 3 picks, best first.`,
     },
@@ -347,6 +389,8 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
         checkout: params.checkoutDate,
         traveller_preferences: params.preferenceText || "no specific preference stated — optimise for overall value",
         budget_max_per_night: params.budgetMaxPerNight ?? null,
+        budget_min_per_night: params.budgetMinPerNight ?? null,
+        wants_luxury: params.wantsLuxury ?? false,
         candidates,
       }),
     },
@@ -377,9 +421,11 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
         toPick(
           row,
           distanceKm,
-          distanceKm !== null
-            ? `Closest match to "${params.preferenceText}" among top-rated options.`
-            : "Top-rated option in the area."
+          params.wantsLuxury || params.budgetMinPerNight != null
+            ? `Top-rated ${row.star_rating ?? "high"}-star option in the area.`
+            : distanceKm !== null
+              ? `Closest match to "${params.preferenceText}" among top-rated options.`
+              : "Top-rated option in the area."
         )
       );
   }
@@ -403,8 +449,10 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
   //     the real, over-budget price once Stage B runs. Re-checking against the live
   //     price here closes that gap.
   const budget = params.budgetMaxPerNight;
+  const budgetMin = params.budgetMinPerNight;
   const overBudget = (p: HotelPick) => budget != null && p.liveDailyRate !== undefined && p.liveDailyRate > budget;
-  const isDead = (p: HotelPick) => p.liveDailyRate === undefined || overBudget(p);
+  const underBudget = (p: HotelPick) => budgetMin != null && p.liveDailyRate !== undefined && p.liveDailyRate < budgetMin;
+  const isDead = (p: HotelPick) => p.liveDailyRate === undefined || overBudget(p) || underBudget(p);
 
   const MAX_LIVE_CHECK_ATTEMPTS = 8;
   const tried = new Set(picks.map((p) => p.hotelId));
@@ -434,9 +482,11 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
       picks[idx] = toPick(
         alt.row,
         alt.distanceKm,
-        alt.distanceKm !== null
-          ? `Closest match to "${params.preferenceText}" among top-rated options with live availability.`
-          : "Top-rated option in the area with live availability."
+        params.wantsLuxury || params.budgetMinPerNight != null
+          ? `Top-rated ${alt.row.star_rating ?? "high"}-star option with live availability.`
+          : alt.distanceKm !== null
+            ? `Closest match to "${params.preferenceText}" among top-rated options with live availability.`
+            : "Top-rated option in the area with live availability."
       );
     }
     if (!swappedAny) break; // exhausted the whole candidate pool
@@ -452,6 +502,13 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
     picks = picks.map((p) =>
       overBudget(p)
         ? { ...p, reasoning: `${p.reasoning} (note: ${p.liveCurrency ?? p.currency ?? "USD"} ${p.liveDailyRate} is above your ${budget}/night budget — no cheaper option was available nearby.)` }
+        : p
+    );
+  }
+  if (budgetMin != null) {
+    picks = picks.map((p) =>
+      underBudget(p)
+        ? { ...p, reasoning: `${p.reasoning} (note: ${p.liveCurrency ?? p.currency ?? "USD"} ${p.liveDailyRate} is below your ${budgetMin}/night minimum — no pricier option was available nearby.)` }
         : p
     );
   }
