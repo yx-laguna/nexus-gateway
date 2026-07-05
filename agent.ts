@@ -59,6 +59,11 @@ interface StoredHotelSearch {
   children: number;
   preferenceText?: string;
   budgetMaxPerNight?: number;
+  // Which of result.picks the traveller has singled out (by name, resolved from
+  // chosen_hotel_text) — so the booking link, once asked for, matches what they actually
+  // chose instead of always the top-ranked pick. Cleared whenever a genuinely fresh
+  // search replaces the picks it referred to.
+  chosenHotelId?: number;
 }
 const lastHotelSearch = new Map<number, StoredHotelSearch>();
 
@@ -164,6 +169,15 @@ const GoalIntentSchema = z.object({
    * hand back the exact same picks. false = no explicit ask for alternates.
    */
   wants_different_hotels: z.boolean().default(false),
+  /**
+   * Free text naming/identifying WHICH of the shown hotel options the traveller means —
+   * e.g. "the Grand Hyatt", "YOTEL", "the second one" (resolved to that hotel's name using
+   * conversation history). Filled whenever they express a preference/decision, independent
+   * of purchase_ready — someone can pick a favourite before asking for the link. Used so
+   * the eventual booking link matches the hotel they actually chose, not just the top pick.
+   * Null if no specific hotel has been singled out.
+   */
+  chosen_hotel_text: z.string().nullish(),
   // ── Hotel-search fields (only meaningful when a "hotel"-type category is present) ──
   // Populated opportunistically from anywhere in the conversation — null if not mentioned yet.
   // destination_city MUST be just the city/place name (e.g. "Bangkok") — never a full sentence,
@@ -240,6 +254,16 @@ hotels, just needing current pricing) and from a genuinely new search (new city/
 preference stated) — this is specifically "not these ones, something different, same criteria
 otherwise". Default false.
 
+## chosen_hotel_text detection
+Whenever the traveller singles out ONE specific hotel from the options already shown — deciding
+on it, asking about it specifically, or picking it by position — set chosen_hotel_text to that
+hotel's exact name as it appeared in the conversation (look at the last hotel options message in
+history to resolve "the second one"/"#2"/"the YOTEL one" to the actual property name). Examples:
+"I'll go with the Grand Hyatt" → "Grand Hyatt Singapore"; "let's do the second one" → resolve
+using history; "the YOTEL looks good" → "YOTEL Singapore Orchard Road". This fires independent of
+purchase_ready — someone can pick a favourite before asking for the link, and that choice should
+still be remembered when they do. Null if no single hotel has been singled out this turn.
+
 ## Output — ONLY valid JSON, no explanation:
 {
   "goal": string,
@@ -258,6 +282,7 @@ otherwise". Default false.
   "purchase_ready": bool,
   "wants_realtime_prices": bool,
   "wants_different_hotels": bool,
+  "chosen_hotel_text": string|null,
   "destination_city": string|null,
   "checkin_date": string|null,
   "checkout_date": string|null,
@@ -345,6 +370,10 @@ export interface EnrichedCategory {
   // search that only gets real-time prices/landingURL once Stage B (fetchLiveAgodaPrices)
   // has run — either on explicit request or because purchase_ready needs the booking link.
   agodaSmart?: LocalSearchResult;
+  // Which agodaSmart.picks entry (by hotelId) the traveller has singled out, resolved from
+  // chosen_hotel_text. buildReply uses this instead of always the top pick when revealing
+  // the booking link. Undefined = no specific choice made yet, default to picks[0].
+  chosenHotelId?: number;
 }
 
 async function runTools(
@@ -529,6 +558,20 @@ async function runTools(
           }
         }
 
+        // Resolve which hotel (if any) the traveller has singled out, so the eventual
+        // booking link matches their actual choice instead of always the top pick. A fresh
+        // search invalidates any earlier choice (those hotelIds may not even be in the new
+        // picks) unless this turn's chosen_hotel_text happens to match one of the new ones.
+        let chosenHotelId: number | undefined = shouldSearch ? undefined : stored?.chosenHotelId;
+        if (agodaSmart && intent.chosen_hotel_text) {
+          const needle = intent.chosen_hotel_text.trim().toLowerCase();
+          const match = agodaSmart.picks.find((p) => {
+            const name = p.hotelName.toLowerCase();
+            return needle.length > 0 && (name.includes(needle) || needle.includes(name));
+          });
+          if (match) chosenHotelId = match.hotelId;
+        }
+
         // Remember this search (with whatever live data we now have) for a later turn —
         // including the params that decide whether a future turn can reuse it as-is.
         if (agodaSmart) {
@@ -545,6 +588,7 @@ async function runTools(
               children: intent.children ?? stored?.children ?? 0,
               preferenceText: (intent.hotel_preference_text ?? stored?.preferenceText) ?? undefined,
               budgetMaxPerNight: (intent.budget_max_per_night ?? stored?.budgetMaxPerNight) ?? undefined,
+              chosenHotelId,
             });
           }
         }
@@ -561,6 +605,7 @@ async function runTools(
             info: { id: "", name: cat.label } as MerchantInfo,
             link: null,
             agodaSmart,
+            chosenHotelId,
           } satisfies EnrichedCategory;
         }
 
@@ -579,6 +624,7 @@ async function runTools(
             info: primary.info,
             link: null,
             agodaSmart,
+            chosenHotelId,
           } satisfies EnrichedCategory;
         }
 
@@ -602,6 +648,7 @@ async function runTools(
           acpJob: primaryJob,
           extraPlatforms,
           agodaSmart,
+          chosenHotelId,
         } satisfies EnrichedCategory;
       }
 
@@ -798,15 +845,19 @@ function buildReply(
       });
     }
 
-    // Reveal the specific, dated, hotel-tagged Agoda booking link only once the
-    // user is purchase-ready — same "don't push links while browsing" rule as
-    // everything else in this bot.
+    // Reveal the specific, dated, hotel-tagged Agoda booking link only once the user is
+    // purchase-ready — same "don't push links while browsing" rule as everything else in
+    // this bot. Links to whichever hotel the traveller actually chose (chosenHotelId,
+    // resolved from chosen_hotel_text) — falls back to the top-ranked pick only if they
+    // never singled one out.
     if (agodaPicks.length > 0 && purchaseReady) {
-      const top = agodaPicks[0];
-      if (top.landingURL) {
-        lines.push(`→ Book *${top.hotelName}* directly on Agoda: ${top.landingURL}`);
+      const chosen =
+        (matched?.chosenHotelId != null && agodaPicks.find((p) => p.hotelId === matched.chosenHotelId)) ||
+        agodaPicks[0];
+      if (chosen.landingURL) {
+        lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${chosen.landingURL}`);
       } else {
-        lines.push(`→ Couldn't confirm a live booking link for *${top.hotelName}* just now — try again in a moment.`);
+        lines.push(`→ Couldn't confirm a live booking link for *${chosen.hotelName}* just now — try again in a moment.`);
       }
     }
 
