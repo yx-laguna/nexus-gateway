@@ -57,12 +57,21 @@ interface FeedSource {
 const SHOPEE_COUNTRIES = ["SG", "MY", "PH", "TH", "TW", "ID"] as const;
 const IHERB_COUNTRIES = ["SG", "MY", "PH"] as const;
 
+// TEMPORARY scope-back, explicit instruction: PH/TH/ID (and TW) each run 1M-ish rows
+// and take several minutes apiece to download, making a full refresh take too long
+// end to end. Restrict Shopee ingestion to SG+MY for now regardless of which
+// SHOPEE_FEED_URL_* env vars happen to be set on Render — easy to widen again later
+// by adding countries back to this set (the feed URLs themselves don't need to be
+// removed from the dashboard; they'll just sit unused until re-enabled here).
+const SHOPEE_COUNTRIES_ENABLED = new Set(["SG", "MY"]);
+
 const SHOPEE_CURRENCY: Record<string, string> = { SG: "SGD", MY: "MYR", PH: "PHP", TH: "THB", TW: "TWD", ID: "IDR" };
 const IHERB_CURRENCY: Record<string, string> = { SG: "SGD", MY: "MYR", PH: "PHP" };
 
 function getConfiguredFeedSources(): FeedSource[] {
   const sources: FeedSource[] = [];
   for (const country of SHOPEE_COUNTRIES) {
+    if (!SHOPEE_COUNTRIES_ENABLED.has(country)) continue;
     const url = process.env[`SHOPEE_FEED_URL_${country}`];
     if (url) sources.push({ merchant: "shopee", country, url });
   }
@@ -519,7 +528,14 @@ export function scheduleDailyProductRefresh(): void {
   const knownKeys = new Set(Object.keys(meta?.sources ?? {}));
   const newSourceKeys = [...configuredKeys].filter((k) => !knownKeys.has(k));
 
-  const dueNow = dbMissing || !meta || elapsed >= ONE_DAY_MS || newSourceKeys.length > 0;
+  // Mirror image of the above: a source that WAS successfully ingested last time
+  // but is no longer configured/enabled (e.g. SHOPEE_COUNTRIES_ENABLED shrank) means
+  // the live catalog still has its old rows sitting around. Refresh immediately so
+  // disabling a slow country actually drops it from the live data right away,
+  // instead of leaving it there until the next 24h cycle.
+  const removedSourceKeys = [...knownKeys].filter((k) => !configuredKeys.has(k));
+
+  const dueNow = dbMissing || !meta || elapsed >= ONE_DAY_MS || newSourceKeys.length > 0 || removedSourceKeys.length > 0;
   const initialDelay = dueNow ? 0 : ONE_DAY_MS - elapsed;
 
   console.log(
@@ -527,9 +543,11 @@ export function scheduleDailyProductRefresh(): void {
       ? "[product-refresh] no catalog on disk yet — bootstrapping now (first boot on this disk)"
       : newSourceKeys.length > 0
         ? `[product-refresh] new feed source(s) configured since last refresh (${newSourceKeys.join(", ")}) — refreshing now`
-        : dueNow
-          ? "[product-refresh] catalog is stale — refreshing now"
-          : `[product-refresh] catalog is fresh — next refresh in ${(initialDelay / 3_600_000).toFixed(1)}h`
+        : removedSourceKeys.length > 0
+          ? `[product-refresh] source(s) no longer configured/enabled (${removedSourceKeys.join(", ")}) — refreshing now to drop them from the live catalog`
+          : dueNow
+            ? "[product-refresh] catalog is stale — refreshing now"
+            : `[product-refresh] catalog is fresh — next refresh in ${(initialDelay / 3_600_000).toFixed(1)}h`
   );
 
   const run = () => {
