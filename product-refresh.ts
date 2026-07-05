@@ -53,10 +53,10 @@ interface FeedSource {
   url: string;
 }
 
-const SHOPEE_COUNTRIES = ["SG", "MY", "PH", "TH", "TW"] as const;
+const SHOPEE_COUNTRIES = ["SG", "MY", "PH", "TH", "TW", "ID"] as const;
 const IHERB_COUNTRIES = ["SG", "MY", "PH"] as const;
 
-const SHOPEE_CURRENCY: Record<string, string> = { SG: "SGD", MY: "MYR", PH: "PHP", TH: "THB", TW: "TWD" };
+const SHOPEE_CURRENCY: Record<string, string> = { SG: "SGD", MY: "MYR", PH: "PHP", TH: "THB", TW: "TWD", ID: "IDR" };
 const IHERB_CURRENCY: Record<string, string> = { SG: "SGD", MY: "MYR", PH: "PHP" };
 
 function getConfiguredFeedSources(): FeedSource[] {

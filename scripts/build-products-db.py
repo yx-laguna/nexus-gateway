@@ -128,7 +128,7 @@ def ingest_shopee(conn, country, csv_path):
     t0 = time.time()
     n = 0
     buf = []
-    currency = {"SG": "SGD", "MY": "MYR", "PH": "PHP", "TH": "THB", "TW": "TWD"}.get(country, "USD")
+    currency = {"SG": "SGD", "MY": "MYR", "PH": "PHP", "TH": "THB", "TW": "TWD", "ID": "IDR"}.get(country, "USD")
 
     insert_sql = """
         INSERT OR REPLACE INTO products

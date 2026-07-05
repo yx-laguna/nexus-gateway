@@ -536,7 +536,7 @@ async function runTools(
   // for it. VN is included per explicit request even though no feed is configured for
   // it yet (see product-refresh.ts) — hasLocalCatalog just returns false there today,
   // so it falls through to the same fallback until a feed is added; nothing breaks.
-  const SHOPEE_PRESENCE_COUNTRIES = new Set(["SG", "MY", "TH", "PH", "TW", "VN"]);
+  const SHOPEE_PRESENCE_COUNTRIES = new Set(["SG", "MY", "TH", "PH", "TW", "VN", "ID"]);
 
   function platformsForCategory(label: string, primary: string): string[] {
     const key = label.toLowerCase();
