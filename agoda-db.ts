@@ -86,6 +86,21 @@ export function searchHotelsByCityId(cityId: number, limit = 500): HotelRow[] {
   return stmt.all(cityId, limit) as unknown as HotelRow[];
 }
 
+/**
+ * Name search within a city — used when the traveller names a specific hotel that isn't
+ * (or is no longer) part of the currently active ranked search, e.g. they named a hotel
+ * that got filtered out by a later, unrelated budget/preference change. Ordered by rating
+ * so the most-likely-correct match (of possibly several similarly-named properties) comes
+ * first.
+ */
+export function searchHotelsByNameInCity(cityId: number, nameQuery: string, limit = 10): HotelRow[] {
+  const db = getDb();
+  const stmt = db.prepare(
+    `SELECT * FROM hotels WHERE city_id = ? AND hotel_name LIKE ? ORDER BY rating_average DESC, number_of_reviews DESC LIMIT ?`
+  );
+  return stmt.all(cityId, `%${nameQuery}%`, limit) as unknown as HotelRow[];
+}
+
 /** Look up enrichment rows for a batch of hotel IDs (from a live API search response). */
 export function getHotelsByIds(hotelIds: number[]): Map<number, HotelRow> {
   const result = new Map<number, HotelRow>();

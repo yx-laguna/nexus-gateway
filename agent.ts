@@ -26,7 +26,7 @@ import {
   type MintedLink,
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
-import { searchLocalHotels, fetchLiveAgodaPrices, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
+import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -64,6 +64,11 @@ interface StoredHotelSearch {
   // chose instead of always the top-ranked pick. Cleared whenever a genuinely fresh
   // search replaces the picks it referred to.
   chosenHotelId?: number;
+  // Set instead of chosenHotelId when the traveller named a hotel that ISN'T in
+  // result.picks (e.g. it got filtered out by a later budget/preference change) —
+  // looked up directly by name via findHotelPickByName, independent of the active
+  // ranked search. Takes priority over chosenHotelId when both are somehow present.
+  chosenHotelOverride?: HotelPick;
 }
 const lastHotelSearch = new Map<number, StoredHotelSearch>();
 
@@ -374,6 +379,9 @@ export interface EnrichedCategory {
   // chosen_hotel_text. buildReply uses this instead of always the top pick when revealing
   // the booking link. Undefined = no specific choice made yet, default to picks[0].
   chosenHotelId?: number;
+  // Set instead of chosenHotelId when the chosen hotel isn't in agodaSmart.picks at all —
+  // looked up directly by name (see findHotelPickByName). Takes priority in buildReply.
+  chosenHotelOverride?: HotelPick;
 }
 
 async function runTools(
@@ -526,14 +534,16 @@ async function runTools(
           // the same 3 hotels. Only fall through to null if we truly have nothing yet.
           : Promise.resolve(stored ? stored.result : null);
 
-        const [tripResult, agodaResult, localSearchResult] = await Promise.allSettled([
-          resolveMerchant("trip-com", intent.geo),
-          resolveMerchant("agoda", intent.geo),
-          localSearchPromise,
-        ]);
-
-        const trip = tripResult.status === "fulfilled" ? tripResult.value : null;
-        const agoda = agodaResult.status === "fulfilled" ? agodaResult.value : null;
+        // Trip.com/Agoda generic ACP-mint links are PAUSED for hotels per explicit request:
+        // "it gives the trip.com and agoda link. I dont want this. lets pause this link
+        // generaton for now." Our own agodaSmart picks already carry live prices and a
+        // direct per-hotel Agoda booking link (landingURL), which covers the booking need
+        // without the generic merchant-affiliate line. To re-enable, restore the
+        // resolveMerchant("trip-com"/"agoda") calls below in the Promise.allSettled and
+        // drop the hardcoded nulls.
+        const [localSearchResult] = await Promise.allSettled([localSearchPromise]);
+        const trip: { id: string; info: MerchantInfo } | null = null;
+        const agoda: { id: string; info: MerchantInfo } | null = null;
         let agodaSmart = localSearchResult.status === "fulfilled" ? localSearchResult.value ?? undefined : undefined;
 
         // searchLocalHotels() already fetches live prices for a fresh search (shouldSearch).
@@ -563,13 +573,42 @@ async function runTools(
         // search invalidates any earlier choice (those hotelIds may not even be in the new
         // picks) unless this turn's chosen_hotel_text happens to match one of the new ones.
         let chosenHotelId: number | undefined = shouldSearch ? undefined : stored?.chosenHotelId;
+        let chosenHotelOverride: HotelPick | undefined = shouldSearch ? undefined : stored?.chosenHotelOverride;
         if (agodaSmart && intent.chosen_hotel_text) {
           const needle = intent.chosen_hotel_text.trim().toLowerCase();
           const match = agodaSmart.picks.find((p) => {
             const name = p.hotelName.toLowerCase();
             return needle.length > 0 && (name.includes(needle) || needle.includes(name));
           });
-          if (match) chosenHotelId = match.hotelId;
+          if (match) {
+            chosenHotelId = match.hotelId;
+            chosenHotelOverride = undefined; // a real match in the active list beats any stale override
+          } else {
+            // Not in the currently active picks — e.g. an earlier budget/preference
+            // change filtered it out. Look it up directly rather than silently falling
+            // back to whatever picks[0] happens to be.
+            const ci = intent.checkin_date ?? stored?.checkinDate;
+            const co = intent.checkout_date ?? stored?.checkoutDate;
+            const city = intent.destination_city ?? stored?.cityQuery;
+            if (ci && co && city) {
+              try {
+                const found = await findHotelPickByName(city, intent.chosen_hotel_text, {
+                  checkinDate: ci,
+                  checkoutDate: co,
+                  adults: intent.adults ?? stored?.adults ?? 2,
+                  children: intent.children ?? stored?.children ?? 0,
+                  countryHint: intent.geo,
+                });
+                if (found) {
+                  chosenHotelOverride = found;
+                  chosenHotelId = undefined;
+                  console.log(`[agent] resolved chosen_hotel_text "${intent.chosen_hotel_text}" via direct lookup (not in active picks)`);
+                }
+              } catch (err) {
+                console.error(`[agent] findHotelPickByName failed:`, err instanceof Error ? err.message : err);
+              }
+            }
+          }
         }
 
         // Remember this search (with whatever live data we now have) for a later turn —
@@ -589,26 +628,30 @@ async function runTools(
               preferenceText: (intent.hotel_preference_text ?? stored?.preferenceText) ?? undefined,
               budgetMaxPerNight: (intent.budget_max_per_night ?? stored?.budgetMaxPerNight) ?? undefined,
               chosenHotelId,
+              chosenHotelOverride,
             });
           }
         }
 
-        if (!trip && !agoda && !agodaSmart) throw new Error(`No hotel merchants available for ${cat.label}`);
+        if (!agodaSmart) throw new Error(`No hotel merchants available for ${cat.label}`);
 
-        // No Laguna-side merchant resolved at all, but the real Agoda search still
-        // came back — return that alone rather than failing the whole category.
-        if (!trip && !agoda) {
-          console.log(`[agent] hotel: no ACP merchant resolved for "${cat.label}", but agodaSmart has ${agodaSmart!.picks.length} pick(s)`);
-          return {
-            label: cat.label,
-            recommendations: cat.recommendations,
-            info: { id: "", name: cat.label } as MerchantInfo,
-            link: null,
-            agodaSmart,
-            chosenHotelId,
-          } satisfies EnrichedCategory;
-        }
+        // Trip.com/Agoda ACP-mint links are paused for hotels (see the hardcoded
+        // trip/agoda nulls above) — so this is now always the return path. Our own
+        // agodaSmart picks (live prices + direct per-hotel booking link) cover the
+        // booking need without the generic merchant-affiliate line.
+        console.log(`[agent] hotel: ACP mint paused, returning agodaSmart alone (${agodaSmart.picks.length} pick(s)) for "${cat.label}"`);
+        return {
+          label: cat.label,
+          recommendations: cat.recommendations,
+          info: { id: "", name: cat.label } as MerchantInfo,
+          link: null,
+          agodaSmart,
+          chosenHotelId,
+          chosenHotelOverride,
+        } satisfies EnrichedCategory;
 
+        /* --- ACP mint flow, paused — restore by deleting the block above and
+         * reverting the trip/agoda hardcoded nulls to the resolveMerchant calls. ---
         // Primary = trip-com, extra = agoda (or swap if trip-com failed)
         const primary = trip ?? agoda!;
         const extra = trip && agoda ? agoda : null;
@@ -625,6 +668,7 @@ async function runTools(
             link: null,
             agodaSmart,
             chosenHotelId,
+            chosenHotelOverride,
           } satisfies EnrichedCategory;
         }
 
@@ -649,7 +693,9 @@ async function runTools(
           extraPlatforms,
           agodaSmart,
           chosenHotelId,
+          chosenHotelOverride,
         } satisfies EnrichedCategory;
+        --- end paused block --- */
       }
 
       // Non-hotel: find first available merchant and optionally mint
@@ -847,17 +893,19 @@ function buildReply(
 
     // Reveal the specific, dated, hotel-tagged Agoda booking link only once the user is
     // purchase-ready — same "don't push links while browsing" rule as everything else in
-    // this bot. Links to whichever hotel the traveller actually chose (chosenHotelId,
-    // resolved from chosen_hotel_text) — falls back to the top-ranked pick only if they
-    // never singled one out.
-    if (agodaPicks.length > 0 && purchaseReady) {
+    // this bot. Priority: chosenHotelOverride (a hotel the traveller named that fell
+    // outside the currently active picks, e.g. filtered out by a later budget change —
+    // resolved independently via findHotelPickByName) beats a chosenHotelId match within
+    // agodaPicks, which beats the top-ranked pick if they never singled one out. No
+    // fallback text when a link genuinely isn't available — per explicit request, we
+    // don't repeat a stale "try again in a moment" message; we just omit the line.
+    if (purchaseReady) {
       const chosen =
-        (matched?.chosenHotelId != null && agodaPicks.find((p) => p.hotelId === matched.chosenHotelId)) ||
-        agodaPicks[0];
-      if (chosen.landingURL) {
+        matched?.chosenHotelOverride ??
+        (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined) ??
+        (agodaPicks.length > 0 ? agodaPicks[0] : undefined);
+      if (chosen?.landingURL) {
         lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${chosen.landingURL}`);
-      } else {
-        lines.push(`→ Couldn't confirm a live booking link for *${chosen.hotelName}* just now — try again in a moment.`);
       }
     }
 

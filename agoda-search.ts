@@ -27,7 +27,7 @@
 import { chat, type ChatMessage } from "./broker.js";
 import { findCity, type CityMatch } from "./agoda-city-lookup.js";
 import { searchHotelsByIds, type AgodaSearchResult } from "./agoda-api.js";
-import { searchHotelsByCityId, isAgodaDbAvailable, type HotelRow } from "./agoda-db.js";
+import { searchHotelsByCityId, searchHotelsByNameInCity, isAgodaDbAvailable, type HotelRow } from "./agoda-db.js";
 
 // ---------------------------------------------------------------------------
 // Stage A's two Kimi calls (geocode estimate + ranking) both have solid,
@@ -177,6 +177,20 @@ function isLikelyNonBookable(row: HotelRow): boolean {
   return NON_BOOKABLE_RE.test(row.hotel_name ?? "") || NON_BOOKABLE_RE.test(row.overview ?? "");
 }
 
+function toPick(row: HotelRow, distanceKm: number | null, reasoning: string): HotelPick {
+  return {
+    hotelId: row.hotel_id,
+    hotelName: row.hotel_name ?? `Hotel #${row.hotel_id}`,
+    address: row.address,
+    distanceKm,
+    approxRatePerNight: row.rates_from,
+    currency: row.rates_currency,
+    starRating: row.star_rating,
+    reviewScore: row.rating_average,
+    reasoning,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Stage A — local DB search, no live API call
 // ---------------------------------------------------------------------------
@@ -240,18 +254,30 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
       scored = rows
         .filter((r) => r.latitude !== null && r.longitude !== null)
         .map((row) => ({ row, distanceKm: haversineKm(coords.lat, coords.lon, row.latitude!, row.longitude!) }))
-        .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity))
-        .slice(0, 40);
+        .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
       console.log(
         `[agoda-search] geocoded "${params.preferenceText}" -> ${coords.lat},${coords.lon} — ${scored.length} hotels scored by distance`
       );
     } else {
       console.log(`[agoda-search] could not geocode "${params.preferenceText}" — ranking on text/rating only`);
-      scored = rows.slice(0, 40).map((row) => ({ row, distanceKm: null }));
+      scored = rows.map((row) => ({ row, distanceKm: null }));
     }
   } else {
-    scored = rows.slice(0, 40).map((row) => ({ row, distanceKm: null }));
+    scored = rows.map((row) => ({ row, distanceKm: null }));
   }
+
+  // When a budget is specified, a hotel with a known static rate (already confirmed <=
+  // budget above) is a meaningfully stronger bet to also have a real live rate than one
+  // with rates_from: null. Real logs showed a budget search return 0 live prices across
+  // every one of 6 candidates tried — the null-rate leniency policy (kept above so we
+  // don't drop a hotel blind) means a budget-constrained pool skews heavily toward
+  // unlisted-price properties, which correlate with "no live rate either". Stable-sort so
+  // known-rate candidates are tried first, without disturbing the distance/rating order
+  // otherwise.
+  if (params.budgetMaxPerNight != null) {
+    scored = [...scored].sort((a, b) => (a.row.rates_from !== null ? 0 : 1) - (b.row.rates_from !== null ? 0 : 1));
+  }
+  scored = scored.slice(0, 40);
 
   const candidates = scored.map(({ row, distanceKm }) => ({
     hotel_id: row.hotel_id,
@@ -295,20 +321,6 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
       }),
     },
   ];
-
-  function toPick(row: HotelRow, distanceKm: number | null, reasoning: string): HotelPick {
-    return {
-      hotelId: row.hotel_id,
-      hotelName: row.hotel_name ?? `Hotel #${row.hotel_id}`,
-      address: row.address,
-      distanceKm,
-      approxRatePerNight: row.rates_from,
-      currency: row.rates_currency,
-      starRating: row.star_rating,
-      reviewScore: row.rating_average,
-      reasoning,
-    };
-  }
 
   let picks: HotelPick[] = [];
   try {
@@ -447,4 +459,39 @@ export async function fetchLiveAgodaPrices(
       landingURL: l.landingURL,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Direct lookup by name — for when the traveller names a specific hotel that isn't (or
+// is no longer) part of the currently active ranked search. Real example: a search got
+// re-run with a budget constraint, which dropped a pricier hotel from the picks; the
+// traveller then said "I'll book the [that hotel]" — nothing resolved it because it
+// genuinely wasn't in agodaSmart.picks anymore. This looks the name up directly against
+// the local DB (not the ranked candidate pool) and fetches its live price/landingURL on
+// its own, independent of whatever search is currently active.
+// ---------------------------------------------------------------------------
+
+export async function findHotelPickByName(
+  cityQuery: string,
+  nameQuery: string,
+  params: { checkinDate: string; checkoutDate: string; adults?: number; children?: number; countryHint?: string | null }
+): Promise<HotelPick | null> {
+  const cityMatches = findCity(cityQuery, params.countryHint);
+  if (cityMatches.length === 0) return null;
+  const resolvedCity = cityMatches[0];
+
+  if (!isAgodaDbAvailable()) return null;
+
+  const rows = searchHotelsByNameInCity(resolvedCity.city_id, nameQuery, 5).filter((r) => !isLikelyNonBookable(r));
+  if (rows.length === 0) {
+    console.log(`[agoda-search] no DB match for "${nameQuery}" in ${resolvedCity.city}`);
+    return null;
+  }
+
+  const best = rows[0]; // highest-rated of the name matches
+  const [priced] = await fetchLiveAgodaPrices([toPick(best, null, `You chose this one.`)], params);
+  console.log(
+    `[agoda-search] resolved "${nameQuery}" -> ${best.hotel_name} (${best.hotel_id}), live=${priced.liveDailyRate !== undefined}`
+  );
+  return priced;
 }
