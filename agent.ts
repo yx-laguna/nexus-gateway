@@ -240,14 +240,22 @@ Today's date is ${todayISO}. Resolve any relative date the user mentions ("next 
 - "off_topic": nothing to do with travel or shopping. Set is_off_topic: true.
 
 ## purchase_ready detection
-Set purchase_ready: true ONLY if the user EXPLICITLY asks for the link to book or purchase —
-e.g. "give me the link to book", "send me the purchase link", "can I get the booking link",
-"link please", "share the link so I can buy it". This must be a direct request for the link
-itself, not just general enthusiasm or a decision.
-Set purchase_ready: false for everything else — including "book this", "I'll go with the
-Marriott", "I want to buy it", "let's do it", "I'm ready", or comparing named options. Those
-signal a decision, not a request for the link, so keep purchase_ready: false until they
-explicitly ask for the link. When in doubt, default to false.
+For HOTELS specifically: set purchase_ready: true whenever the user names or clearly singles
+out a specific hotel AND uses booking language about it — "let's book <hotel>", "I want to
+book <hotel>", "book <hotel> please", "help me book <hotel>", as well as direct link requests
+like "give me the link", "need the agoda link", "send the booking link". A real conversation
+showed a strict "must explicitly ask for the link" rule taking 3 messages to get there ("lets
+book park royal!" and "I want to book park royal hotel, please help" both got treated as
+false, re-triggering a fresh unrelated search each time before the user finally said "need the
+agoda link"). That's broken UX — once someone names a hotel and says "book" in any form, they
+are ready for the link; don't make them ask twice. Whenever this fires, also set
+chosen_hotel_text to that hotel's name so the right booking link gets attached.
+For RETAIL/PRODUCT categories, keep the narrower rule: purchase_ready: true ONLY on an
+explicit request for the link/purchase itself ("give me the link to book", "send me the
+purchase link", "link please") — NOT on "I'll take it", "I want to buy it", "let's do it",
+since those trigger a real merchant/ACP link mint we don't want to fire prematurely. When in
+doubt for retail, default to false; when in doubt for a named hotel with booking language,
+default to true.
 
 ## Hotel search fields (only fill when a hotel/stay/accommodation category is present)
 - "destination_city": ONLY the city or place name the hotel search is for — e.g. "Bangkok", "Singapore", "New York". NEVER a full sentence, NEVER a neighbourhood-only value, NEVER the category label. This is looked up in an exact city database, so it must be just the place name a city lookup would recognise. Null if no destination is clear yet.
@@ -255,7 +263,7 @@ explicitly ask for the link. When in doubt, default to false.
 - "adults" / "children": default adults=2, children=0 if travel party size isn't mentioned.
 - "budget_max_per_night": a number if the user gave any per-night/total MAXIMUM budget hint ("under $100", "budget of $150", "no more than $200"), else null.
 - "budget_min_per_night": a number if the user gave any per-night MINIMUM price floor ("above $200", "at least $150", "$200+", "over $300 a night", "something pricier than that"), else null. This is the opposite direction from budget_max_per_night — never fill both from the same phrase.
-- "hotel_preference_text": capture ANY location/proximity cue LITERALLY, keeping the actual place name intact — e.g. "near Thonglor" not "nightlife area", "close to Marina Bay Sands" not "near the water". This gets geocoded downstream, so a specific real name matters far more than a vibe description. If there's no location cue, other preferences (vibe, must-have amenities) are fine here too. Null if nothing beyond price/stars was said.
+- "hotel_preference_text": capture ANY location/proximity cue LITERALLY, keeping the actual place name intact — e.g. "near Thonglor" not "nightlife area", "close to Marina Bay Sands" not "near the water". This gets geocoded downstream, so a specific real name matters far more than a vibe description. If there's no location cue, other preferences (vibe, must-have amenities) are fine here too. Null if nothing beyond price/stars was said. NEVER put a hotel's own name/brand here — "let's book Park Royal" names a HOTEL, not a neighbourhood; that belongs in chosen_hotel_text only. Confusing the two was a real bug: it made hotel_preference_text look "changed" and triggered a pointless fresh search with a completely different set of hotels, right when the user was trying to book the one they'd already picked.
 - If destination_city, checkin_date, or checkout_date is missing for a hotel search, set needs_clarification: true and ask for whichever is missing in clarification_question — but still fill in categories/recommendations from what you know so the user gets a useful reply either way.
 
 ## wants_realtime_prices detection (separate from purchase_ready)
@@ -539,15 +547,23 @@ async function runTools(
         // nothing else changed, since it should re-sort candidates by star_rating.
         const luxuryChanged = intent.wants_luxury && !stored?.wantsLuxury;
 
+        // Hard disable, per explicit request: naming a specific hotel is a NARROWING/decision
+        // signal, never a request for something new — it should never spawn a fresh, unrelated
+        // search. Real bug: "lets book park royal!" and "I want to book park royal hotel,
+        // please help" both re-triggered a full re-search with 3 completely different hotels
+        // (Park Royal itself wasn't even among them), taking 3 messages to reach the booking
+        // link. That happened because the LLM occasionally mis-files a named hotel into
+        // hotel_preference_text/budget fields, making preferenceChanged/budgetChanged look
+        // true. When chosen_hotel_text is set, ignore those softer signals entirely — only a
+        // genuinely new city/dates, or an explicit "show me different ones", should re-search.
+        const namingSpecificHotel = !!intent.chosen_hotel_text;
+
         const shouldSearch =
           canSearch &&
           (!stored ||
             cityChanged ||
             datesChanged ||
-            preferenceChanged ||
-            budgetChanged ||
-            minBudgetChanged ||
-            luxuryChanged ||
+            (!namingSpecificHotel && (preferenceChanged || budgetChanged || minBudgetChanged || luxuryChanged)) ||
             intent.wants_different_hotels);
 
         const localSearchPromise: Promise<LocalSearchResult | null> = shouldSearch
