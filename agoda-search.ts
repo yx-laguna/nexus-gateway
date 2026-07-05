@@ -348,13 +348,22 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
 
   // Live prices now come back fast enough (Kimi's thinking-mode fix cut ranking from
   // 40s+ to ~2-3s) to fetch upfront in the very first reply, not gate behind an
-  // explicit "check real prices" request. This also doubles as quality control: a
-  // candidate with no live rate at all is the same signature we saw from airside
-  // transit lounges before adding the name filter — some other non-standard listing
-  // slipping through (odd/promotional names, obscure serviced apartments) that Agoda's
-  // live search has nothing for. Rather than show "price on request" for a dead end,
-  // swap it for the next-best untried candidate and check that one instead, bounded so
-  // we never check more than a handful of hotels total.
+  // explicit "check real prices" request. This also doubles as quality control — a pick
+  // gets swapped for the next-best untried candidate (bounded so we never check more
+  // than a handful of hotels total) when either:
+  //   - it has no live rate at all (same signature as the airside transit lounges from
+  //     the previous fix — some other non-standard listing Agoda's live search has
+  //     nothing for), or
+  //   - its LIVE rate breaks the traveller's stated budget. The earlier static-data
+  //     budget filter (above, using the CSV's rates_from) only catches a hotel whose
+  //     stale estimate was already over budget — a hotel with rates_from: null or a
+  //     misleadingly low static estimate sails through that filter and only reveals
+  //     the real, over-budget price once Stage B runs. Re-checking against the live
+  //     price here closes that gap.
+  const budget = params.budgetMaxPerNight;
+  const overBudget = (p: HotelPick) => budget != null && p.liveDailyRate !== undefined && p.liveDailyRate > budget;
+  const isDead = (p: HotelPick) => p.liveDailyRate === undefined || overBudget(p);
+
   const MAX_LIVE_CHECK_ATTEMPTS = 6;
   const tried = new Set(picks.map((p) => p.hotelId));
   let attempts = picks.length;
@@ -366,7 +375,7 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
       adults: params.adults,
       children: params.children,
     });
-    const deadIdx = picks.findIndex((p) => p.liveDailyRate === undefined);
+    const deadIdx = picks.findIndex(isDead);
     if (deadIdx === -1 || attempts >= MAX_LIVE_CHECK_ATTEMPTS) break;
     const alt = scored.find(({ row }) => !tried.has(row.hotel_id));
     if (!alt) break; // no more untried candidates left
@@ -378,6 +387,17 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
       alt.distanceKm !== null
         ? `Closest match to "${params.preferenceText}" among top-rated options with live availability.`
         : "Top-rated option in the area with live availability."
+    );
+  }
+
+  // If we exhausted every candidate/attempt and a pick is still over budget (no cheaper
+  // alternative existed), say so plainly in the reasoning rather than silently showing
+  // a price that contradicts what the traveller asked for.
+  if (budget != null) {
+    picks = picks.map((p) =>
+      overBudget(p)
+        ? { ...p, reasoning: `${p.reasoning} (note: ${p.liveCurrency ?? p.currency ?? "USD"} ${p.liveDailyRate} is above your ${budget}/night budget — no cheaper option was available nearby.)` }
+        : p
     );
   }
 

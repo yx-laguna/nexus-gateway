@@ -787,12 +787,14 @@ function buildReply(
         }
         const ratingStr = pick.starRating ? ` (★${pick.starRating}${pick.reviewScore ? ` · ${pick.reviewScore}/10` : ""})` : "";
         lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning} · ${priceStr}${distanceStr}${ratingStr}`);
+        if (i < agodaPicks.length - 1) lines.push(""); // blank line between options, not after the last
       });
     } else {
       // Fall back to Step 1's LLM-knowledge recommendations (no real search data yet —
       // e.g. dates not given, or city didn't resolve to an Agoda city_id).
       recs.forEach((rec, i) => {
         lines.push(`${i + 1}. ${rec}`);
+        if (i < recs.length - 1) lines.push(""); // blank line between options, not after the last
       });
     }
 
