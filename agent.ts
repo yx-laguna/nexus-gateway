@@ -27,6 +27,8 @@ import {
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
 import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
+import { searchLocalProducts, findProductPickByName, type ProductSearchResult, type ProductPick } from "./product-search.js";
+import { hasLocalCatalog } from "./product-db.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +75,24 @@ interface StoredHotelSearch {
   chosenHotelOverride?: HotelPick;
 }
 const lastHotelSearch = new Map<number, StoredHotelSearch>();
+
+// Same idea for local product search (Shopee/iHerb), keyed by userId+category label
+// (rather than just userId) since a single turn can have multiple product categories
+// active at once (e.g. "toothbrush" AND "vitamin C serum" in the same message), each
+// needing its own independent stored search.
+interface StoredProductSearch {
+  result: ProductSearchResult;
+  query: string;
+  country: string;
+  merchants: string[];
+  // Which of result.picks the shopper has singled out (by product_id+merchant),
+  // resolved from chosen_product_text — mirrors StoredHotelSearch.chosenHotelId.
+  chosenProductKey?: string;
+  // Set instead of chosenProductKey when the shopper named a product that ISN'T in
+  // result.picks — looked up directly by title, mirrors chosenHotelOverride.
+  chosenProductOverride?: ProductPick;
+}
+const lastProductSearch = new Map<string, StoredProductSearch>();
 
 // ---------------------------------------------------------------------------
 // System prompt — concierge-first, USDC as a footnote
@@ -211,6 +231,21 @@ const GoalIntentSchema = z.object({
   // Free text describing what matters to the traveller for hotel choice —
   // location/distance, vibe, amenities — passed to Kimi for ranking, not a fixed filter.
   hotel_preference_text: z.string().nullish(),
+  // ── Local product-search fields (Shopee/iHerb catalog — only meaningful when a
+  // category resolves to a merchant we have a local catalog for; see hasLocalCatalog) ──
+  // The literal thing the shopper is searching for — "toothbrush", "vitamin c serum" —
+  // fed straight into an FTS5 keyword search. NEVER a full sentence or the category
+  // label; if the category label is itself specific enough to search with directly
+  // ("Toothbrushes"), still extract the plain noun phrase a shopper would type into a
+  // search box. Null if genuinely nothing specific was said yet.
+  product_query: z.string().nullish(),
+  // A stated maximum price for the product search — same treatment as
+  // budget_max_per_night (null-price leniency, not a hard drop of unpriced items).
+  product_budget_max: z.number().positive().nullish(),
+  // Mirrors chosen_hotel_text — free text naming/identifying which shown product the
+  // shopper means ("the Oral-B one", "the second one"), resolved using conversation
+  // history. Null if nothing has been singled out this turn.
+  chosen_product_text: z.string().nullish(),
 });
 
 type GoalIntent = z.infer<typeof GoalIntentSchema>;
@@ -301,6 +336,15 @@ using history; "the YOTEL looks good" → "YOTEL Singapore Orchard Road". This f
 purchase_ready — someone can pick a favourite before asking for the link, and that choice should
 still be remembered when they do. Null if no single hotel has been singled out this turn.
 
+## product_query detection (retail categories with a local catalog — toothbrushes, supplements, general shopping, etc.)
+Set "product_query" to the literal thing being searched for — e.g. "toothbrush", "electric
+toothbrush", "vitamin c serum". This is fed directly into a keyword search, so extract just the
+plain noun phrase a shopper would type into a search box — never a full sentence, never the
+broader category label. "product_budget_max" is a number if a maximum price was given ("under
+$20", "no more than 50 ringgit"), else null. "chosen_product_text" mirrors chosen_hotel_text: set
+it to the specific product the shopper singled out from options already shown (by name or
+position, resolved using history) — null if nothing has been singled out this turn.
+
 ## Output — ONLY valid JSON, no explanation:
 {
   "goal": string,
@@ -328,7 +372,10 @@ still be remembered when they do. Null if no single hotel has been singled out t
   "children": number|null,
   "budget_max_per_night": number|null,
   "budget_min_per_night": number|null,
-  "hotel_preference_text": string|null
+  "hotel_preference_text": string|null,
+  "product_query": string|null,
+  "product_budget_max": number|null,
+  "chosen_product_text": string|null
 }
 
 ## Recommendation format — ALWAYS give exactly 3, be specific and add context:
@@ -350,6 +397,8 @@ still be remembered when they do. Null if no single hotel has been singled out t
 - Gifts/General → "temu" or "shein-global"
 - Luxury → "vertu" or "farfetch"
 - Sports → "nike" or "puma" or "crocs"
+- Household/Personal Care/General retail (anything without a more specific platform above,
+  e.g. toothbrushes, kitchenware, phone cases, general "buy me X") → "shopee"
 
 Max 4 categories. Output JSON only.`,
     },
@@ -417,6 +466,16 @@ export interface EnrichedCategory {
   // Set instead of chosenHotelId when the chosen hotel isn't in agodaSmart.picks at all —
   // looked up directly by name (see findHotelPickByName). Takes priority in buildReply.
   chosenHotelOverride?: HotelPick;
+  // Real, Kimi-ranked local product picks (Shopee/iHerb — see product-search.ts). Same
+  // role as agodaSmart, for retail categories with a local catalog instead of a hotel
+  // search. No ACP mint / affiliate link involved yet — discovery only, see
+  // product-search.ts's header comment.
+  productSearch?: ProductSearchResult;
+  // Which productSearch.picks entry (by "merchant:productId") the shopper has singled
+  // out, resolved from chosen_product_text. Mirrors chosenHotelId.
+  chosenProductKey?: string;
+  // Mirrors chosenHotelOverride — set when the chosen product isn't in productSearch.picks.
+  chosenProductOverride?: ProductPick;
 }
 
 async function runTools(
@@ -450,12 +509,17 @@ async function runTools(
     // Retail
     fashion:        ["shein-global", "nike", "zalora", "crocs"],
     apparel:        ["shein-global", "nike", "zalora", "crocs"],
-    shopping:       ["temu", "shein-global", "zalora"],
+    shopping:       ["shopee", "temu", "shein-global", "zalora"],
     supplements:    ["iherb"],
     health:         ["iherb"],
     electronics:    ["lenovo"],
     sports:         ["nike", "puma", "crocs"],
     luxury:         ["vertu", "farfetch"],
+    // General marketplace catch-all — Shopee sells almost everything, so it's the
+    // strongest default for anything that isn't clearly fashion/health/electronics.
+    "personal care":  ["shopee"],
+    household:        ["shopee"],
+    "general":        ["shopee"],
   };
 
   // Keywords used to auto-append safety-net fallbacks for unlisted categories
@@ -472,9 +536,9 @@ async function runTools(
     if (TRAVEL_RE.test(label) && !list.includes("trip-com")) {
       list.push("trip-com");
     }
-    // Safety-net: any unrecognised shopping category → append shein-global / temu
-    if (SHOPPING_RE.test(label) && !list.some((p) => ["shein-global", "temu", "nike"].includes(p))) {
-      list.push("shein-global", "temu");
+    // Safety-net: any unrecognised shopping category → append shopee / shein-global / temu
+    if (SHOPPING_RE.test(label) && !list.some((p) => ["shopee", "shein-global", "temu", "nike"].includes(p))) {
+      list.push("shopee", "shein-global", "temu");
     }
 
     return list;
@@ -758,6 +822,91 @@ async function runTools(
         --- end paused block --- */
       }
 
+      // Local product search (Shopee/iHerb) — parallel to the hotel branch above.
+      // Only kicks in when at least one of this category's platforms has a local
+      // catalog for the shopper's country (see hasLocalCatalog) — everything else
+      // (fashion merchants, countries we haven't ingested yet, etc.) falls straight
+      // through to the existing generic Laguna-merchant-mint loop below, unchanged.
+      const productMerchants = platforms.filter((p) => hasLocalCatalog(p, intent.geo));
+      if (productMerchants.length > 0) {
+        const searchKey = `${userId}:${cat.label}`;
+        const stored = lastProductSearch.get(searchKey);
+        const queryText = intent.product_query ?? stored?.query ?? cat.recommendations[0] ?? cat.label;
+
+        // Re-search when the shopper actually said something new (a different query,
+        // a country change) or we don't have a stored search yet — otherwise reuse
+        // what we already found, same "don't silently re-search on every turn" logic
+        // as hotels (though without the full nuance hotels eventually needed — this is
+        // a first pass, expect follow-up fixes once this gets real usage).
+        const queryChanged = !!intent.product_query && intent.product_query !== stored?.query;
+        const countryChanged = !!intent.geo && intent.geo !== stored?.country;
+        const shouldSearch = !stored || queryChanged || countryChanged;
+
+        let productResult: ProductSearchResult | null = stored?.result ?? null;
+        if (shouldSearch) {
+          try {
+            productResult = await searchLocalProducts({
+              query: queryText,
+              country: intent.geo ?? stored?.country ?? "SG",
+              merchants: productMerchants,
+              budgetMax: intent.product_budget_max ?? undefined,
+            });
+          } catch (err) {
+            console.error(`[agent] searchLocalProducts failed:`, err instanceof Error ? err.message : err);
+            productResult = null;
+          }
+        }
+
+        if (!productResult) throw new Error(`No product search results for ${cat.label}`);
+
+        // Resolve which product (if any) the shopper has singled out, mirroring the
+        // hotel branch's chosenHotelId/chosenHotelOverride resolution.
+        let chosenProductKey: string | undefined = shouldSearch ? undefined : stored?.chosenProductKey;
+        let chosenProductOverride: ProductPick | undefined = shouldSearch ? undefined : stored?.chosenProductOverride;
+        if (intent.chosen_product_text) {
+          const needle = intent.chosen_product_text.trim().toLowerCase();
+          const match = productResult.picks.find((p) => {
+            const title = p.title.toLowerCase();
+            return needle.length > 0 && (title.includes(needle) || needle.includes(title));
+          });
+          if (match) {
+            chosenProductKey = `${match.merchant}:${match.productId}`;
+            chosenProductOverride = undefined;
+          } else {
+            const found = findProductPickByName({
+              nameQuery: intent.chosen_product_text,
+              country: intent.geo ?? stored?.country ?? "SG",
+              merchants: productMerchants,
+            });
+            if (found) {
+              chosenProductOverride = found;
+              chosenProductKey = undefined;
+              console.log(`[agent] resolved chosen_product_text "${intent.chosen_product_text}" via direct lookup (not in active picks)`);
+            }
+          }
+        }
+
+        lastProductSearch.set(searchKey, {
+          result: productResult,
+          query: queryText,
+          country: intent.geo ?? stored?.country ?? "SG",
+          merchants: productMerchants,
+          chosenProductKey,
+          chosenProductOverride,
+        });
+
+        console.log(`[agent] product search: "${queryText}" -> ${productResult.picks.length} pick(s) for "${cat.label}"`);
+        return {
+          label: cat.label,
+          recommendations: cat.recommendations,
+          info: { id: "", name: cat.label } as MerchantInfo,
+          link: null,
+          productSearch: productResult,
+          chosenProductKey,
+          chosenProductOverride,
+        } satisfies EnrichedCategory;
+      }
+
       // Non-hotel: find first available merchant and optionally mint
       for (const platform of platforms) {
         const merchants = await searchMerchants({
@@ -923,6 +1072,7 @@ function buildReply(
     lines.push(`${emoji} *${cat.label}*`);
 
     const agodaPicks = matched?.agodaSmart?.picks ?? [];
+    const productPicks = matched?.productSearch?.picks ?? [];
     const recs = cat.recommendations.slice(0, 3);
 
     // Once the traveller has both said they're purchase-ready AND singled out a specific
@@ -935,6 +1085,24 @@ function buildReply(
 
     if (purchaseReady && chosenForConfirm) {
       lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
+    } else if (productPicks.length > 0) {
+      // Real Shopee/iHerb picks from our own catalog — grounded facts, not LLM guesses.
+      // Raw product_url shown directly (no ACP mint / affiliate wrapping yet — discovery
+      // only for now, see product-search.ts).
+      productPicks.forEach((pick, i) => {
+        const price = pick.salePrice ?? pick.price;
+        let priceStr = "";
+        if (price !== null) {
+          const wasDiscounted = pick.salePrice !== null && pick.price !== null && pick.salePrice < pick.price;
+          priceStr = ` · ${pick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${pick.currency ?? ""} ${pick.price!.toFixed(2)})` : ""}`;
+        }
+        const ratingStr = pick.rating ? ` (★${pick.rating}${pick.soldCount ? ` · ${pick.soldCount} sold` : ""})` : "";
+        const officialStr = pick.isOfficial ? " ✅ Official Store" : "";
+        lines.push(`${i + 1}. *${pick.title}* — ${pick.reasoning}${priceStr}${ratingStr}${officialStr}`);
+        if (pick.productUrl) lines.push(`   ${pick.productUrl}`);
+        if (i < productPicks.length - 1) lines.push("");
+      });
+      lines.push(`\n_Direct links for now — cashback tracking on these is coming soon 🚧_`);
     } else if (agodaPicks.length > 0) {
       // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
       // either a live Agoda price (Stage B has run) or a static database estimate.
@@ -986,7 +1154,7 @@ function buildReply(
         const alsoStr = extras ? ` (also on ${extras})` : "";
         lines.push(`→ We recommend booking via *${primaryName}*${alsoStr} — _affiliate link coming shortly_ ⏳`);
       }
-    } else if (!hasMerchant && agodaPicks.length === 0) {
+    } else if (!hasMerchant && agodaPicks.length === 0 && productPicks.length === 0) {
       // Nothing resolved at all for this category — no merchant, no real search results.
       lines.push(`→ via ${cat.platform_search}`);
     }

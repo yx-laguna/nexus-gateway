@@ -24,6 +24,12 @@ services:
       - key: AGODA_CITY_LOOKUP_PATH
         value: /var/data/agoda_city_lookup.json
 
+      # ── Retail product catalog (Shopee/iHerb — see product-db.ts, product-search.ts,
+      #    scripts/build-products-db.py). Same disk as the Agoda data above. Not in
+      #    git — rebuild with build-products-db.py whenever fresh feed CSVs come in.
+      - key: PRODUCTS_DB_PATH
+        value: /var/data/products.sqlite
+
       # ── Telegram ─────────────────────────────────────────────────────────────
       - key: TELEGRAM_BOT_TOKEN
         sync: false          # fill in Render dashboard

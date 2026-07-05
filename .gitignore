@@ -9,3 +9,7 @@ dist/
 # (agoda_hotels.sqlite is ~390MB). See NOTES-agoda-hosting.md.
 agoda_hotels.sqlite
 agoda_city_lookup.json
+
+# Retail product catalog (Shopee/iHerb) — same reasoning, see product-db.ts and
+# scripts/build-products-db.py. Currently ~170MB.
+products.sqlite
