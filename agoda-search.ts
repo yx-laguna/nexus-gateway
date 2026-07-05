@@ -76,6 +76,10 @@ export interface LocalSearchParams {
   budgetMaxPerNight?: number;
   preferenceText?: string; // free text: "near Thonglor", "close to the beach", etc.
   countryHint?: string | null; // ISO alpha-2 — narrows city name collisions
+  // Hotel IDs to leave out of the candidate pool entirely — used when the traveller
+  // explicitly asks for different/other options than what was already shown, so a
+  // re-search can't just land on the same picks again.
+  excludeHotelIds?: number[];
 }
 
 export interface HotelPick {
@@ -206,6 +210,15 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
     return null;
   }
 
+  if (params.excludeHotelIds?.length) {
+    const exclude = new Set(params.excludeHotelIds);
+    rows = rows.filter((r) => !exclude.has(r.hotel_id));
+  }
+  if (rows.length === 0) {
+    console.log(`[agoda-search] 0 local rows left for ${resolvedCity.city} (${resolvedCity.city_id}) after excluding previously-shown hotels`);
+    return null;
+  }
+
   // Budget filter — keep hotels with an unknown rate rather than drop them blind.
   if (params.budgetMaxPerNight) {
     const budget = params.budgetMaxPerNight;
@@ -333,13 +346,49 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
     `[agoda-search] ${resolvedCity.city} (${resolvedCity.city_id}): ${rows.length} local candidates -> ${picks.length} picks (geocoded=${preferenceGeocoded})`
   );
 
+  // Live prices now come back fast enough (Kimi's thinking-mode fix cut ranking from
+  // 40s+ to ~2-3s) to fetch upfront in the very first reply, not gate behind an
+  // explicit "check real prices" request. This also doubles as quality control: a
+  // candidate with no live rate at all is the same signature we saw from airside
+  // transit lounges before adding the name filter — some other non-standard listing
+  // slipping through (odd/promotional names, obscure serviced apartments) that Agoda's
+  // live search has nothing for. Rather than show "price on request" for a dead end,
+  // swap it for the next-best untried candidate and check that one instead, bounded so
+  // we never check more than a handful of hotels total.
+  const MAX_LIVE_CHECK_ATTEMPTS = 6;
+  const tried = new Set(picks.map((p) => p.hotelId));
+  let attempts = picks.length;
+
+  for (let round = 0; round < 3; round++) {
+    picks = await fetchLiveAgodaPrices(picks, {
+      checkinDate: params.checkinDate,
+      checkoutDate: params.checkoutDate,
+      adults: params.adults,
+      children: params.children,
+    });
+    const deadIdx = picks.findIndex((p) => p.liveDailyRate === undefined);
+    if (deadIdx === -1 || attempts >= MAX_LIVE_CHECK_ATTEMPTS) break;
+    const alt = scored.find(({ row }) => !tried.has(row.hotel_id));
+    if (!alt) break; // no more untried candidates left
+    tried.add(alt.row.hotel_id);
+    attempts++;
+    picks[deadIdx] = toPick(
+      alt.row,
+      alt.distanceKm,
+      alt.distanceKm !== null
+        ? `Closest match to "${params.preferenceText}" among top-rated options with live availability.`
+        : "Top-rated option in the area with live availability."
+    );
+  }
+
   return { resolvedCity, candidateCount: rows.length, preferenceGeocoded, picks };
 }
 
 // ---------------------------------------------------------------------------
-// Stage B — live Agoda pricing for the Stage A picks. Only call this when the
-// user explicitly asks for real-time prices, or the booking link (which
-// needs live data regardless).
+// Live Agoda pricing for a set of picks. searchLocalHotels() above already calls
+// this itself so every reply has live prices from the start — this export stays
+// public for the rare case a caller wants to explicitly re-check/refresh prices
+// for a search that's being reused as-is (see agent.ts's stored-search reuse).
 // ---------------------------------------------------------------------------
 
 export async function fetchLiveAgodaPrices(

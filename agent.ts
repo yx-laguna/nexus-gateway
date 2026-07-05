@@ -77,8 +77,11 @@ Conversational, warm, knowledgeable — like a friend who knows all the best dea
 - Shopping: item/category is enough. Budget optional.
 - If the user gave you info already — use it, don't ask again.
 - Don't mention rebates or links until the user shows clear purchase intent.
-- Hotel prices you show at first are database estimates, not live prices. If the user seems to
-  want exact current pricing, mention they can ask you to "check real-time prices."
+- Hotel prices shown are live Agoda rates whenever available for that property — occasionally
+  one shows "price on request" if Agoda has no live rate for it; that's just that one property,
+  not a general limitation, so no need to caveat every hotel reply about it.
+- If a hotel option looks off (odd name, doesn't fit what they asked for) or they just want to
+  see other options, offer to find different ones — don't just repeat the same list.
 
 ## Purchase intent signals (system will then send links)
 Only an explicit request for the link itself counts — e.g. "give me the link to book", "send me
@@ -153,6 +156,14 @@ const GoalIntentSchema = z.object({
    * link, just current prices). false = keep showing the static database estimate.
    */
   wants_realtime_prices: z.boolean().default(false),
+  /**
+   * true = user explicitly wants DIFFERENT hotel options than what was already shown —
+   * "find me 3 more", "these look off, give me other options", "exclude these, show
+   * something else". Forces a fresh search (bypassing the stored-search reuse) with the
+   * previously-shown hotel IDs excluded from the candidate pool, so the reply can't just
+   * hand back the exact same picks. false = no explicit ask for alternates.
+   */
+  wants_different_hotels: z.boolean().default(false),
   // ── Hotel-search fields (only meaningful when a "hotel"-type category is present) ──
   // Populated opportunistically from anywhere in the conversation — null if not mentioned yet.
   // destination_city MUST be just the city/place name (e.g. "Bangkok") — never a full sentence,
@@ -220,6 +231,15 @@ actual current rates", "get live prices for these 3", "use the agoda api to chec
 is about wanting up-to-date pricing, NOT about wanting the booking link — someone can want live
 prices without being purchase_ready, and vice versa. Default false.
 
+## wants_different_hotels detection
+Set wants_different_hotels: true if the user is unhappy with or wants to move past the hotels
+already shown and get OTHER ones — e.g. "find me 3 more recommendations", "these look weird,
+show me other options", "give me alternatives", "exclude these, what else is there", "none of
+these work, try again". This is distinct from wants_realtime_prices (which is about the SAME
+hotels, just needing current pricing) and from a genuinely new search (new city/dates/location
+preference stated) — this is specifically "not these ones, something different, same criteria
+otherwise". Default false.
+
 ## Output — ONLY valid JSON, no explanation:
 {
   "goal": string,
@@ -237,6 +257,7 @@ prices without being purchase_ready, and vice versa. Default false.
   "is_off_topic": bool,
   "purchase_ready": bool,
   "wants_realtime_prices": bool,
+  "wants_different_hotels": bool,
   "destination_city": string|null,
   "checkin_date": string|null,
   "checkout_date": string|null,
@@ -293,6 +314,7 @@ Max 4 categories. Output JSON only.`,
       needs_clarification: false,
       purchase_ready: false,
       wants_realtime_prices: false,
+      wants_different_hotels: false,
     };
   }
 }
@@ -416,10 +438,11 @@ async function runTools(
       const isHotel = HOTEL_RE.test(cat.label);
       console.log(`[agent] category "${cat.label}" isHotel=${isHotel} — trying platforms:`, platforms);
 
-      // For hotels: always mint BOTH trip-com and agoda in parallel, AND (new) run our own
-      // local hotel search + Kimi ranking alongside it whenever we have enough info
-      // (destination + dates) — Stage A, no live API call, blended into every reply.
-      // Live Agoda pricing (Stage B) only happens on explicit request — see below.
+      // For hotels: always mint BOTH trip-com and agoda in parallel, AND run our own local
+      // hotel search + Kimi ranking alongside it whenever we have enough info (destination +
+      // dates). Now that Kimi's thinking-mode fix cut ranking latency to ~2-3s, searchLocalHotels
+      // itself fetches live Agoda prices upfront too — no more "price on request" placeholders
+      // in the very first reply.
       if (isHotel) {
         // destination_city is a clean place name from the LLM (e.g. "Bangkok") — required for
         // an exact-match city lookup. cat.label/intent.goal are full sentences and never match.
@@ -428,13 +451,15 @@ async function runTools(
 
         // Only treat this as a genuinely NEW search if this turn actually SAID something
         // that differs from the stored search — a different city, different dates, a new
-        // preference/budget. Crucially: if this turn's extraction came back null for a
-        // field (e.g. hotel_preference_text, because the message was "get prices for these
-        // 3 hotels" with no location cue in it), that must NOT count as "changed" — it just
+        // preference/budget — OR the user explicitly asked for different hotels than what
+        // was already shown. Crucially: if this turn's extraction came back null for a field
+        // (e.g. hotel_preference_text, because the message was "get prices for these 3
+        // hotels" with no location cue in it), that must NOT count as "changed" — it just
         // means the user didn't repeat themselves, and we should keep using what we already
-        // had rather than silently re-searching without it (which is what produced a
+        // had rather than silently re-searching without it (which previously produced a
         // different, ungeocoded, generic set of hotels than the ones actually being
-        // discussed).
+        // discussed). wants_different_hotels is the explicit, unambiguous signal for "no,
+        // not these — something else" that overrides all of that and forces a fresh search.
         const cityChanged = !!intent.destination_city && intent.destination_city !== stored?.cityQuery;
         const datesChanged =
           (!!intent.checkin_date && intent.checkin_date !== stored?.checkinDate) ||
@@ -445,18 +470,24 @@ async function runTools(
           intent.budget_max_per_night != null && intent.budget_max_per_night !== stored?.budgetMaxPerNight;
 
         const shouldSearch =
-          canSearch && (!stored || cityChanged || datesChanged || preferenceChanged || budgetChanged);
+          canSearch &&
+          (!stored || cityChanged || datesChanged || preferenceChanged || budgetChanged || intent.wants_different_hotels);
 
         const localSearchPromise: Promise<LocalSearchResult | null> = shouldSearch
           ? searchLocalHotels({
               cityQuery: intent.destination_city!,
               checkinDate: intent.checkin_date!,
               checkoutDate: intent.checkout_date!,
-              adults: intent.adults ?? 2,
-              children: intent.children ?? 0,
-              budgetMaxPerNight: intent.budget_max_per_night ?? undefined,
-              preferenceText: intent.hotel_preference_text ?? undefined,
+              adults: intent.adults ?? stored?.adults ?? 2,
+              children: intent.children ?? stored?.children ?? 0,
+              budgetMaxPerNight: (intent.budget_max_per_night ?? stored?.budgetMaxPerNight) ?? undefined,
+              preferenceText: (intent.hotel_preference_text ?? stored?.preferenceText) ?? undefined,
               countryHint: intent.geo,
+              // Only exclude previously-shown hotels when the user explicitly asked for
+              // different ones — a normal re-search (new city/dates) has no reason to avoid
+              // a hotel just because it showed up in an unrelated earlier search.
+              excludeHotelIds:
+                intent.wants_different_hotels && stored ? stored.result.picks.map((p) => p.hotelId) : undefined,
             }).catch((err) => {
               console.error(`[agent] searchLocalHotels failed:`, err instanceof Error ? err.message : err);
               return null;
@@ -476,9 +507,11 @@ async function runTools(
         const agoda = agodaResult.status === "fulfilled" ? agodaResult.value : null;
         let agodaSmart = localSearchResult.status === "fulfilled" ? localSearchResult.value ?? undefined : undefined;
 
-        // Stage B — live Agoda pricing — only when explicitly asked for real-time prices,
-        // or purchase_ready needs live data to produce a real booking link.
-        if (agodaSmart && (intent.wants_realtime_prices || mintLinks)) {
+        // searchLocalHotels() already fetches live prices for a fresh search (shouldSearch).
+        // This only matters when we REUSED a stored search as-is and the user explicitly
+        // wants a refreshed price check on those same hotels — re-fetch to get current rates
+        // rather than whatever was cached from whenever that search first ran.
+        if (agodaSmart && !shouldSearch && intent.wants_realtime_prices) {
           const ci = intent.checkin_date ?? stored?.checkinDate;
           const co = intent.checkout_date ?? stored?.checkoutDate;
           if (ci && co) {
