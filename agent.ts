@@ -739,8 +739,6 @@ function buildReply(
     const agodaPicks = matched?.agodaSmart?.picks ?? [];
     const recs = cat.recommendations.slice(0, 3);
 
-    let anyLivePrice = false;
-
     if (agodaPicks.length > 0) {
       // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
       // either a live Agoda price (Stage B has run) or a static database estimate.
@@ -748,7 +746,6 @@ function buildReply(
         const distanceStr = pick.distanceKm !== null ? ` · ${pick.distanceKm.toFixed(1)}km away` : "";
         let priceStr: string;
         if (pick.liveDailyRate !== undefined) {
-          anyLivePrice = true;
           priceStr = `${pick.liveCurrency ?? pick.currency ?? "USD"} ${pick.liveDailyRate.toFixed(0)}/night (live)`;
         } else if (pick.approxRatePerNight !== null) {
           priceStr = `~${pick.currency ?? "USD"} ${pick.approxRatePerNight.toFixed(0)}/night (est.)`;
@@ -776,31 +773,26 @@ function buildReply(
       } else {
         lines.push(`→ Couldn't confirm a live booking link for *${top.hotelName}* just now — try again in a moment.`);
       }
-    } else if (agodaPicks.length > 0 && !anyLivePrice) {
-      // Static estimates only — let the user know they can ask for the real thing.
-      lines.push(`_Prices above are database estimates — ask me to "check real-time prices" for exact numbers._`);
     }
 
     // Generic Laguna/ACP merchant line — only when an actual merchant was resolved
-    // (the hotel branch can return agodaSmart alone with no ACP merchant at all).
+    // (the hotel branch can return agodaSmart alone with no ACP merchant at all), and
+    // only when there's something actionable to show (a real link, or one in flight).
+    // No bare "→ via Trip.com" placeholder when nothing's actually happening yet.
     const hasMerchant = !!(matched && (matched.info?.id || matched.link || matched.acpJob));
 
-    if (hasMerchant) {
+    if (hasMerchant && (matched!.link?.shortlink || matched!.acpJob)) {
       const primaryName = matched!.info?.name ?? matched!.info?.id ?? cat.label;
 
-      // Build one clean booking line — no merchant-specific rebate % shown here anymore;
-      // see the generic cashback line appended once at the end of the reply instead.
       if (matched!.link?.shortlink) {
         lines.push(`→ Book via *${primaryName}*: ${matched!.link.shortlink}`);
-      } else if (matched!.acpJob) {
+      } else {
         // Extra platforms inline (e.g. "also on Agoda")
         const extras = (matched!.extraPlatforms ?? []).map(ep => ep.name).join(" & ");
         const alsoStr = extras ? ` (also on ${extras})` : "";
         lines.push(`→ We recommend booking via *${primaryName}*${alsoStr} — _affiliate link coming shortly_ ⏳`);
-      } else {
-        lines.push(`→ via *${primaryName}*`);
       }
-    } else if (agodaPicks.length === 0) {
+    } else if (!hasMerchant && agodaPicks.length === 0) {
       // Nothing resolved at all for this category — no merchant, no real search results.
       lines.push(`→ via ${cat.platform_search}`);
     }
