@@ -34,6 +34,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { parse } from "csv-parse";
 import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { existsSync, renameSync, unlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { reopenProductsDb } from "./product-db.js";
@@ -144,6 +145,20 @@ class StripNulTransform extends Transform {
   }
 }
 
+/** A failed download/parse can leave SQLite having already auto-closed the transaction
+ *  on its own (a bad partial write mid-BEGIN can do this) — calling ROLLBACK on top of
+ *  that throws "cannot rollback - no transaction is active" and, since this runs inside
+ *  an existing catch block, that new error replaces and hides whatever the *real*
+ *  failure was. Swallow rollback-specific failures so the original error is what
+ *  actually surfaces in the logs. */
+function safeRollback(db: DatabaseSync): void {
+  try {
+    db.exec("ROLLBACK");
+  } catch (err) {
+    console.warn(`[product-refresh] rollback no-op (transaction likely already closed by the original error):`, err instanceof Error ? err.message : err);
+  }
+}
+
 async function fetchToNodeStream(url: string): Promise<Readable> {
   const res = await fetch(url);
   if (!res.ok || !res.body) {
@@ -223,42 +238,52 @@ async function ingestShopee(db: DatabaseSync, country: string, url: string): Pro
     VALUES ('shopee', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
   `);
 
-  const nodeStream = await fetchToNodeStream(url);
-  const parser = nodeStream.pipe(new StripNulTransform()).pipe(
-    parse({ columns: true, bom: true, relax_column_count: true, relax_quotes: true, skip_empty_lines: true })
-  );
-
   let n = 0;
   db.exec("BEGIN");
   try {
-    for await (const row of parser as AsyncIterable<Record<string, string>>) {
-      const itemid = row.itemid;
-      if (!itemid) continue;
-      const productUrl = (row.product_link ?? "").trim() || null;
-      stmt.run(
-        country,
-        itemid,
-        row.shopid ?? null,
-        row.title ?? null,
-        truncate(row.description),
-        row.global_category1 ?? null,
-        row.global_brand || null,
-        toFloat(row.price),
-        toFloat(row.sale_price),
-        currency,
-        toFloat(row.item_rating),
-        toInt(row.item_sold),
-        toInt(row.stock),
-        toBoolInt(row.is_official_shop),
-        toBoolInt(row.is_preferred_shop),
-        row.image_link ?? null,
-        productUrl
-      );
-      n++;
-    }
+    // stream.pipeline() (not manual .pipe().pipe()) is what actually matters here — a
+    // manual pipe chain does NOT forward 'error' events between streams, so a network
+    // hiccup partway through a ~200MB+ download (confirmed live: an ERR_HTTP2_STREAM_ERROR
+    // mid-download) surfaced as an unhandled 'error' event and crashed the entire bot
+    // process, not just this one feed. pipeline() attaches proper error handling and
+    // cleanup to every stage, so the same failure now just rejects this promise, gets
+    // caught below, and this one source is skipped while everything else proceeds.
+    const nodeStream = await fetchToNodeStream(url);
+    await pipeline(
+      nodeStream,
+      new StripNulTransform(),
+      parse({ columns: true, bom: true, relax_column_count: true, relax_quotes: true, skip_empty_lines: true }),
+      async function insertRows(source) {
+        for await (const row of source as AsyncIterable<Record<string, string>>) {
+          const itemid = row.itemid;
+          if (!itemid) continue;
+          const productUrl = (row.product_link ?? "").trim() || null;
+          stmt.run(
+            country,
+            itemid,
+            row.shopid ?? null,
+            row.title ?? null,
+            truncate(row.description),
+            row.global_category1 ?? null,
+            row.global_brand || null,
+            toFloat(row.price),
+            toFloat(row.sale_price),
+            currency,
+            toFloat(row.item_rating),
+            toInt(row.item_sold),
+            toInt(row.stock),
+            toBoolInt(row.is_official_shop),
+            toBoolInt(row.is_preferred_shop),
+            row.image_link ?? null,
+            productUrl
+          );
+          n++;
+        }
+      }
+    );
     db.exec("COMMIT");
   } catch (err) {
-    db.exec("ROLLBACK");
+    safeRollback(db);
     throw err;
   }
   console.log(`[product-refresh] shopee:${country} inserted ${n.toLocaleString()} rows in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -278,35 +303,38 @@ async function ingestIherb(db: DatabaseSync, country: string, url: string): Prom
     VALUES ('iherb', ?, ?, NULL, ?, ?, ?, NULL, ?, NULL, ?, NULL, NULL, ?, NULL, NULL, ?, ?, strftime('%s','now'))
   `);
 
-  const nodeStream = await fetchToNodeStream(url);
-  const parser = nodeStream.pipe(new StripNulTransform()).pipe(
-    parse({ columns: true, bom: true, delimiter: "|", relax_column_count: true, relax_quotes: true, skip_empty_lines: true })
-  );
-
   let n = 0;
   db.exec("BEGIN");
   try {
-    for await (const row of parser as AsyncIterable<Record<string, string>>) {
-      const productId = row.productID;
-      if (!productId) continue;
-      const productUrl = unwrapIherbUrl(row.url);
-      stmt.run(
-        country,
-        productId,
-        row.title ?? null,
-        truncate(row.description),
-        row.category ?? null,
-        toFloat(row.price),
-        currency,
-        iherbInStock(row.inventory),
-        row.image ?? null,
-        productUrl
-      );
-      n++;
-    }
+    const nodeStream = await fetchToNodeStream(url);
+    await pipeline(
+      nodeStream,
+      new StripNulTransform(),
+      parse({ columns: true, bom: true, delimiter: "|", relax_column_count: true, relax_quotes: true, skip_empty_lines: true }),
+      async function insertRows(source) {
+        for await (const row of source as AsyncIterable<Record<string, string>>) {
+          const productId = row.productID;
+          if (!productId) continue;
+          const productUrl = unwrapIherbUrl(row.url);
+          stmt.run(
+            country,
+            productId,
+            row.title ?? null,
+            truncate(row.description),
+            row.category ?? null,
+            toFloat(row.price),
+            currency,
+            iherbInStock(row.inventory),
+            row.image ?? null,
+            productUrl
+          );
+          n++;
+        }
+      }
+    );
     db.exec("COMMIT");
   } catch (err) {
-    db.exec("ROLLBACK");
+    safeRollback(db);
     throw err;
   }
   console.log(`[product-refresh] iherb:${country} inserted ${n.toLocaleString()} rows in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
