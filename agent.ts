@@ -1058,6 +1058,7 @@ function buildReply(
 ): string {
   const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
   const lines: string[] = [];
+  let anyProductChosenThisTurn = false;
 
   if (purchaseReady) {
     lines.push(`Great choice! Here's what I found for *${intent.goal}*.\n`);
@@ -1083,8 +1084,34 @@ function buildReply(
       matched?.chosenHotelOverride ??
       (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined);
 
+    // Mirrors chosenForConfirm above, but for products. Unlike hotels this is NOT gated on
+    // purchaseReady — naming a product ("let's buy the kleenex") deliberately stays
+    // purchase_ready:false for retail (see extractIntent's prompt) since there's no ACP
+    // mint to guard against yet, but the shopper still wants THAT item's link the moment
+    // they name it, not buried back in the full list.
+    const chosenProductPick: ProductPick | undefined =
+      matched?.chosenProductOverride ??
+      (matched?.chosenProductKey != null
+        ? productPicks.find((p) => `${p.merchant}:${p.productId}` === matched.chosenProductKey)
+        : undefined);
+
     if (purchaseReady && chosenForConfirm) {
       lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
+    } else if (chosenProductPick) {
+      anyProductChosenThisTurn = true;
+      // No ACP mint / Involve Asia wrapping here — Shopee isn't set up as an Involve Asia
+      // offer yet (see project memory), and Laguna's own "shopee" merchant is an unrelated,
+      // broken network. Just the real, raw product URL so they can actually go buy it.
+      const price = chosenProductPick.salePrice ?? chosenProductPick.price;
+      let priceStr = "";
+      if (price !== null) {
+        const wasDiscounted =
+          chosenProductPick.salePrice !== null && chosenProductPick.price !== null && chosenProductPick.salePrice < chosenProductPick.price;
+        priceStr = ` · ${chosenProductPick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${chosenProductPick.currency ?? ""} ${chosenProductPick.price!.toFixed(2)})` : ""}`;
+      }
+      lines.push(`Got it — *${chosenProductPick.title}*${priceStr}. Here's the direct link:`);
+      lines.push(chosenProductPick.productUrl ?? "_(no direct link on file for this one — sorry!)_");
+      lines.push(`\n_Direct link for now — cashback tracking isn't set up for Shopee/iHerb yet 🚧_`);
     } else if (productPicks.length > 0) {
       // Real Shopee/iHerb picks from our own catalog — grounded facts, not LLM guesses.
       // Raw product_url shown directly (no ACP mint / affiliate wrapping yet — discovery
@@ -1169,6 +1196,10 @@ function buildReply(
     if (hasAnyLink) {
       lines.push(`_Receive up to 6% in cashback when you book via our link 💸_`);
     }
+  } else if (anyProductChosenThisTurn) {
+    // Already handed over a direct link above for the item they named — don't immediately
+    // follow it with "which of these catches your eye", which reads as if nothing happened.
+    lines.push(`Want to look at anything else, or need another item?`);
   } else {
     // Browsing mode — soft close, invite them to pick
     lines.push(`Which of these catches your eye? Happy to dig deeper or send you a booking link when you're ready!`);
