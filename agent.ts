@@ -526,6 +526,18 @@ async function runTools(
   const TRAVEL_RE   = /hotel|flight|travel|trip|cruise|tour|activit|transport|transfer|ferry|train|rail|car\s*rent|accommodation/i;
   const SHOPPING_RE = /shop|fashion|apparel|cloth|wear|bag|shoe|accessor|gift|beauty|cosmetic/i;
 
+  // Countries where we have (or plan to have) a Shopee affiliate datafeed — explicit
+  // policy: for ANY consumer-goods category in these countries, always give the real
+  // local catalog first crack, rather than relying on a category-LABEL keyword match
+  // (CATEGORY_PLATFORMS/SHOPPING_RE above). That keyword-matching approach has a real
+  // gap — a label like "Socks" contains none of those substrings, so it fell straight
+  // through to the generic Laguna-merchant-search fallback, which matched a totally
+  // unrelated merchant ("NBA Top Shot") for a socks query and fired a real ACP mint job
+  // for it. VN is included per explicit request even though no feed is configured for
+  // it yet (see product-refresh.ts) — hasLocalCatalog just returns false there today,
+  // so it falls through to the same fallback until a feed is added; nothing breaks.
+  const SHOPEE_PRESENCE_COUNTRIES = new Set(["SG", "MY", "TH", "PH", "TW", "VN"]);
+
   function platformsForCategory(label: string, primary: string): string[] {
     const key = label.toLowerCase();
     const defaults =
@@ -827,7 +839,19 @@ async function runTools(
       // catalog for the shopper's country (see hasLocalCatalog) — everything else
       // (fashion merchants, countries we haven't ingested yet, etc.) falls straight
       // through to the existing generic Laguna-merchant-mint loop below, unchanged.
-      const productMerchants = platforms.filter((p) => hasLocalCatalog(p, intent.geo));
+      //
+      // Candidate merchants for this check are platformsForCategory's list PLUS
+      // "shopee" whenever this is a non-hotel, non-travel category and the shopper is
+      // in a Shopee-presence country (see SHOPEE_PRESENCE_COUNTRIES) — independent of
+      // whether cat.label happened to contain a matching keyword. This does NOT change
+      // `platforms` itself (still used as-is by the generic fallback loop below when
+      // there's no local catalog match).
+      const isRetailIntent = intent.intent === "retail_shopping" || intent.intent === "product_comparison";
+      const productCandidates = new Set(platforms);
+      if (!isHotel && !TRAVEL_RE.test(cat.label) && isRetailIntent && intent.geo && SHOPEE_PRESENCE_COUNTRIES.has(intent.geo.toUpperCase())) {
+        productCandidates.add("shopee");
+      }
+      const productMerchants = [...productCandidates].filter((p) => hasLocalCatalog(p, intent.geo));
       if (productMerchants.length > 0) {
         const searchKey = `${userId}:${cat.label}`;
         const stored = lastProductSearch.get(searchKey);
