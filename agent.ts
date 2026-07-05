@@ -27,6 +27,7 @@ import {
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
 import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
+import { mintAgodaDeepLink } from "./involve-asia.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -1027,7 +1028,18 @@ function buildReply(
 // a later budget change) beats a chosenHotelId match within agodaPicks, which beats the
 // top-ranked pick if the traveller never singled one out. Returns null when there's
 // nothing purchase-ready to show yet, or no link is actually available.
-function buildBookingLinkMessage(intent: GoalIntent, enriched: EnrichedCategory[], purchaseReady: boolean): string | null {
+//
+// Before handing back chosen.landingURL as-is, wraps it through Involve Asia's deeplink
+// generator (mintAgodaDeepLink) so the click is attributable to the traveller's wallet —
+// verified live that this preserves the exact hotel/dates end to end (unlike Laguna's own
+// mint_link, which silently drops target_url for Agoda). Falls back to the raw landingURL
+// on any failure — a working link always beats no link.
+async function buildBookingLinkMessage(
+  intent: GoalIntent,
+  enriched: EnrichedCategory[],
+  purchaseReady: boolean,
+  walletAddress: string
+): Promise<string | null> {
   if (!purchaseReady) return null;
 
   const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
@@ -1041,7 +1053,30 @@ function buildBookingLinkMessage(intent: GoalIntent, enriched: EnrichedCategory[
       (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined) ??
       (agodaPicks.length > 0 ? agodaPicks[0] : undefined);
     if (chosen?.landingURL) {
-      lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${chosen.landingURL}`);
+      // Pull checkin/checkout straight from the landingURL's own query params rather
+      // than intent.checkin_date/checkout_date — those can be null on a turn that
+      // reused a stored search, but the link itself always has the real dates baked
+      // in already. Only used for cache-key precision and aff_sub reporting metadata;
+      // the actual booking destination comes from landingURL regardless.
+      let ci = "";
+      let co = "";
+      try {
+        const u = new URL(chosen.landingURL);
+        ci = u.searchParams.get("checkin") ?? "";
+        co = u.searchParams.get("checkout") ?? "";
+      } catch {
+        // malformed URL — fall through with empty dates, still cacheable per-wallet/hotel
+      }
+      const bookingUrl = walletAddress
+        ? await mintAgodaDeepLink(chosen.landingURL, {
+            walletAddress,
+            hotelId: chosen.hotelId,
+            hotelName: chosen.hotelName,
+            checkinDate: ci,
+            checkoutDate: co,
+          })
+        : chosen.landingURL;
+      lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${bookingUrl}`);
     }
   }
 
@@ -1175,17 +1210,17 @@ async function _processMessage(
         }
 
         // Dedicated Agoda booking link, sent as its OWN separate message rather than
-        // bundled into the reply above — per explicit request. The link data is already
-        // fully resolved (no async job to wait on), so a short delay is enough to make
-        // sure it lands after the main reply rather than racing it.
-        const bookingLinkMsg = buildBookingLinkMessage(intent, enriched, purchaseReady);
-        if (bookingLinkMsg) {
-          setTimeout(() => {
-            onFollowUp(bookingLinkMsg).catch((err) => {
-              console.error(`[agent] booking-link follow-up failed:`, err instanceof Error ? err.message : err);
-            });
-          }, 600);
-        }
+        // bundled into the reply above — per explicit request. Now involves a real
+        // network call (Involve Asia deeplink wrap, see buildBookingLinkMessage), so it
+        // naturally resolves after the synchronous main reply below rather than needing
+        // an artificial delay.
+        buildBookingLinkMessage(intent, enriched, purchaseReady, walletAddress)
+          .then((bookingLinkMsg) => {
+            if (bookingLinkMsg) return onFollowUp(bookingLinkMsg);
+          })
+          .catch((err) => {
+            console.error(`[agent] booking-link follow-up failed:`, err instanceof Error ? err.message : err);
+          });
       }
 
       // Append clarification if something important is still missing
