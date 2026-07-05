@@ -35,8 +35,8 @@ import { DatabaseSync } from "node:sqlite";
 import { parse } from "csv-parse";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { existsSync, renameSync, unlinkSync, writeFileSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, renameSync, unlinkSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join, basename } from "node:path";
 import { reopenProductsDb } from "./product-db.js";
 
 const DB_PATH = process.env.PRODUCTS_DB_PATH ?? "./products.sqlite";
@@ -345,6 +345,41 @@ async function ingestIherb(db: DatabaseSync, country: string, url: string): Prom
 // Orchestration
 // ---------------------------------------------------------------------------
 
+/**
+ * Deletes any leftover `.products.sqlite.tmp-<pid>` files sitting next to
+ * PRODUCTS_DB_PATH. Real incident (2026-07-05): before the stream.pipeline()
+ * fix, a hard process crash mid-refresh (an unhandled stream error) bypassed
+ * refreshProductsDb()'s own try/finally cleanup entirely — Node died before
+ * that finally block could run — leaving that run's temp file (potentially
+ * several GB, unvacuumed) permanently orphaned on the persistent disk with
+ * nothing left to ever reference or delete it. Each crash+restart added
+ * another one, which is what showed up as disk usage climbing continuously
+ * on the Render dashboard. Every past PID's temp file is stale by definition
+ * (a PID is never reused across restarts), so anything matching the temp
+ * naming pattern found here is always safe to delete on process startup.
+ */
+function cleanupStaleTempFiles(): void {
+  const dir = dirname(DB_PATH) || ".";
+  const prefix = `.${basename(DB_PATH)}.tmp-`;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (err) {
+    console.warn(`[product-refresh] could not scan ${dir} for stale temp files:`, err instanceof Error ? err.message : err);
+    return;
+  }
+  for (const name of entries) {
+    if (!name.startsWith(prefix)) continue;
+    const full = join(dir, name);
+    try {
+      unlinkSync(full);
+      console.log(`[product-refresh] removed stale temp file from a previous crashed run: ${full}`);
+    } catch (err) {
+      console.warn(`[product-refresh] could not remove stale temp file ${full}:`, err instanceof Error ? err.message : err);
+    }
+  }
+}
+
 interface RefreshMeta {
   lastRefreshedAt: number; // epoch ms
   totalRows: number;
@@ -461,6 +496,10 @@ export async function refreshProductsDb(): Promise<void> {
  * render.yaml) is the only design that reaches PRODUCTS_DB_PATH at all.
  */
 export function scheduleDailyProductRefresh(): void {
+  // Runs once per process boot — exactly when any orphaned temp file from a
+  // previous crash would otherwise sit unnoticed. See cleanupStaleTempFiles().
+  cleanupStaleTempFiles();
+
   const sources = getConfiguredFeedSources();
   if (sources.length === 0) {
     console.log("[product-refresh] no feed URLs configured — auto-refresh disabled (set SHOPEE_FEED_URL_*/IHERB_FEED_URL_* to enable)");
