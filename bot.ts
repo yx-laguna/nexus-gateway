@@ -390,8 +390,20 @@ bot.on("message:text", async (ctx: Context) => {
   await ctx.replyWithChatAction("typing");
   try {
     const chatId = ctx.chat!.id;
+    // Same graceful-degrade as sendChunk below: a minted shortlink or hotel/product
+    // name can contain a character Telegram's legacy Markdown parser chokes on
+    // (unmatched *и_/`/[ ] — "can't parse entities" is a real, observed failure mode,
+    // confirmed live: booking-link follow-ups were silently vanishing because this
+    // path had no fallback the way the main reply already did). Retry as plain text
+    // rather than letting the whole follow-up (often the actual booking/product link)
+    // just disappear.
     const onFollowUp = async (msg: string) => {
-      await bot.api.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+      try {
+        await bot.api.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+      } catch (err) {
+        console.warn(`[bot] follow-up Markdown send failed, retrying as plain text:`, err instanceof Error ? err.message : err);
+        await bot.api.sendMessage(chatId, msg.replace(/[*_`[\]]/g, ""));
+      }
     };
     const reply = await processMessage(userId, text, profile.wallet ?? "", profile.country, onFollowUp);
     await sendLongMessage(ctx, reply);
