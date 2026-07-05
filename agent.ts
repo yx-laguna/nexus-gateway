@@ -246,6 +246,15 @@ const GoalIntentSchema = z.object({
   // shopper means ("the Oral-B one", "the second one"), resolved using conversation
   // history. Null if nothing has been singled out this turn.
   chosen_product_text: z.string().nullish(),
+  /**
+   * Mirrors wants_different_hotels — true = shopper explicitly wants OTHER options than
+   * what was already shown for this product category ("show me other options", "these
+   * are the same ones", "different recommendations", "give me alternatives", "none of
+   * these work"). Forces a fresh search (bypassing the stored-search reuse) with the
+   * previously-shown product IDs excluded from the candidate pool, so the reply can't
+   * just hand back the exact same picks. false = no explicit ask for alternates.
+   */
+  wants_different_products: z.boolean().default(false),
 });
 
 type GoalIntent = z.infer<typeof GoalIntentSchema>;
@@ -317,6 +326,17 @@ hotels, just needing current pricing) and from a genuinely new search (new city/
 preference stated) — this is specifically "not these ones, something different, same criteria
 otherwise". Default false.
 
+## wants_different_products detection
+Mirrors wants_different_hotels, for retail/product categories. Set wants_different_products:
+true whenever the shopper is unhappy with or wants to move past the products already shown for
+the SAME search and get OTHER ones — e.g. "do you have other recommendations?", "show me
+different options", "these are the same ones", "give me alternatives", "none of these work".
+A real bug: asking for "other socks recommendations" with the exact same product_query as
+before ("socks") looked identical to just repeating the same search, so it silently kept
+returning the exact same stored picks turn after turn. This field is the explicit signal that
+overrides that reuse and forces a fresh search with the previously-shown products excluded —
+distinct from a genuinely new search (a different product_query stated). Default false.
+
 ## wants_luxury detection
 Set wants_luxury: true if the user asks for something MORE EXPENSIVE/upscale than what was
 shown — "I want something more luxurious", "give me nicer options", "something high-end",
@@ -375,7 +395,8 @@ position, resolved using history) — null if nothing has been singled out this 
   "hotel_preference_text": string|null,
   "product_query": string|null,
   "product_budget_max": number|null,
-  "chosen_product_text": string|null
+  "chosen_product_text": string|null,
+  "wants_different_products": bool
 }
 
 ## Recommendation format — ALWAYS give exactly 3, be specific and add context:
@@ -428,6 +449,7 @@ Max 4 categories. Output JSON only.`,
       purchase_ready: false,
       wants_realtime_prices: false,
       wants_different_hotels: false,
+      wants_different_products: false,
       wants_luxury: false,
     };
   }
@@ -860,11 +882,15 @@ async function runTools(
         // Re-search when the shopper actually said something new (a different query,
         // a country change) or we don't have a stored search yet — otherwise reuse
         // what we already found, same "don't silently re-search on every turn" logic
-        // as hotels (though without the full nuance hotels eventually needed — this is
-        // a first pass, expect follow-up fixes once this gets real usage).
+        // as hotels. wants_different_products is the explicit, unambiguous "no, not
+        // these — something else" signal that overrides reuse even when the query
+        // text itself is unchanged — real bug: "do you have other socks
+        // recommendations?" kept the query as "socks" (same as before), so it looked
+        // identical to just repeating the same search and kept returning the exact
+        // same stored picks turn after turn.
         const queryChanged = !!intent.product_query && intent.product_query !== stored?.query;
         const countryChanged = !!intent.geo && intent.geo !== stored?.country;
-        const shouldSearch = !stored || queryChanged || countryChanged;
+        const shouldSearch = !stored || queryChanged || countryChanged || intent.wants_different_products;
 
         let productResult: ProductSearchResult | null = stored?.result ?? null;
         if (shouldSearch) {
@@ -874,6 +900,12 @@ async function runTools(
               country: intent.geo ?? stored?.country ?? "SG",
               merchants: productMerchants,
               budgetMax: intent.product_budget_max ?? undefined,
+              // Only exclude previously-shown products when explicitly asked for
+              // different ones — a normal re-search (new query/country) has no reason
+              // to avoid a product just because it showed up in an unrelated earlier
+              // search for this same category label.
+              excludeProductIds:
+                intent.wants_different_products && stored ? stored.result.picks.map((p) => p.productId) : undefined,
             });
           } catch (err) {
             console.error(`[agent] searchLocalProducts failed:`, err instanceof Error ? err.message : err);
