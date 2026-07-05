@@ -177,6 +177,26 @@ function isLikelyNonBookable(row: HotelRow): boolean {
   return NON_BOOKABLE_RE.test(row.hotel_name ?? "") || NON_BOOKABLE_RE.test(row.overview ?? "");
 }
 
+// ---------------------------------------------------------------------------
+// Hotel-only filter — per explicit request, recommendations should be actual hotels,
+// not serviced apartments, B&Bs, guesthouses, hostels, villas, etc. Their static rates
+// and live-price availability have both proven far less reliable than standard hotels
+// (see the budget/live-pricing fixes above), on top of just not matching what the
+// traveller usually means by "hotel". The CSV's accommodation_type is a comma-separated
+// list of tags (e.g. "Hotel, Resort", "Serviced apartment, Serviced apartment") — require
+// "Hotel" to be one of the tags, which keeps legitimate combos like "Hotel, Resort" while
+// dropping anything that's purely Apartment/Flat, Guesthouse/B&B, Serviced apartment,
+// Hostel, Villa, Homestay, etc.
+// ---------------------------------------------------------------------------
+
+function isHotelType(row: HotelRow): boolean {
+  const type = row.accommodation_type ?? "";
+  return type
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .includes("hotel");
+}
+
 function toPick(row: HotelRow, distanceKm: number | null, reasoning: string): HotelPick {
   return {
     hotelId: row.hotel_id,
@@ -221,6 +241,16 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
   }
   if (rows.length === 0) {
     console.log(`[agoda-search] 0 local rows left for ${resolvedCity.city} (${resolvedCity.city_id}) after transit-lounge filter`);
+    return null;
+  }
+
+  const beforeTypeFilter = rows.length;
+  rows = rows.filter((r) => isHotelType(r));
+  if (rows.length < beforeTypeFilter) {
+    console.log(`[agoda-search] filtered out ${beforeTypeFilter - rows.length} non-hotel (apartment/B&B/hostel/etc.) listing(s)`);
+  }
+  if (rows.length === 0) {
+    console.log(`[agoda-search] 0 local rows left for ${resolvedCity.city} (${resolvedCity.city_id}) after hotel-type filter`);
     return null;
   }
 
@@ -376,35 +406,48 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
   const overBudget = (p: HotelPick) => budget != null && p.liveDailyRate !== undefined && p.liveDailyRate > budget;
   const isDead = (p: HotelPick) => p.liveDailyRate === undefined || overBudget(p);
 
-  const MAX_LIVE_CHECK_ATTEMPTS = 6;
+  const MAX_LIVE_CHECK_ATTEMPTS = 8;
   const tried = new Set(picks.map((p) => p.hotelId));
   let attempts = picks.length;
 
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < 4; round++) {
     picks = await fetchLiveAgodaPrices(picks, {
       checkinDate: params.checkinDate,
       checkoutDate: params.checkoutDate,
       adults: params.adults,
       children: params.children,
     });
-    const deadIdx = picks.findIndex(isDead);
-    if (deadIdx === -1 || attempts >= MAX_LIVE_CHECK_ATTEMPTS) break;
-    const alt = scored.find(({ row }) => !tried.has(row.hotel_id));
-    if (!alt) break; // no more untried candidates left
-    tried.add(alt.row.hotel_id);
-    attempts++;
-    picks[deadIdx] = toPick(
-      alt.row,
-      alt.distanceKm,
-      alt.distanceKm !== null
-        ? `Closest match to "${params.preferenceText}" among top-rated options with live availability.`
-        : "Top-rated option in the area with live availability."
-    );
+
+    // Replace EVERY dead slot this round (not just the first) so a batch with multiple
+    // no-price picks doesn't take multiple full rounds to clear out.
+    const deadIndices = picks.map((p, i) => (isDead(p) ? i : -1)).filter((i) => i !== -1);
+    if (deadIndices.length === 0 || attempts >= MAX_LIVE_CHECK_ATTEMPTS) break;
+
+    let swappedAny = false;
+    for (const idx of deadIndices) {
+      if (attempts >= MAX_LIVE_CHECK_ATTEMPTS) break;
+      const alt = scored.find(({ row }) => !tried.has(row.hotel_id));
+      if (!alt) break; // no more untried candidates left
+      tried.add(alt.row.hotel_id);
+      attempts++;
+      swappedAny = true;
+      picks[idx] = toPick(
+        alt.row,
+        alt.distanceKm,
+        alt.distanceKm !== null
+          ? `Closest match to "${params.preferenceText}" among top-rated options with live availability.`
+          : "Top-rated option in the area with live availability."
+      );
+    }
+    if (!swappedAny) break; // exhausted the whole candidate pool
   }
 
-  // If we exhausted every candidate/attempt and a pick is still over budget (no cheaper
-  // alternative existed), say so plainly in the reasoning rather than silently showing
-  // a price that contradicts what the traveller asked for.
+  // Never show an option we couldn't get a live price for at all — per explicit request,
+  // drop it rather than displaying a priceless placeholder. An over-budget pick (a real
+  // price that's just too high, with no cheaper alternative found nearby) is kept with an
+  // explanatory note — that's different from "no price found" and still useful information.
+  picks = picks.filter((p) => p.liveDailyRate !== undefined);
+
   if (budget != null) {
     picks = picks.map((p) =>
       overBudget(p)

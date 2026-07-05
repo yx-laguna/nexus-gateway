@@ -865,7 +865,17 @@ function buildReply(
     const agodaPicks = matched?.agodaSmart?.picks ?? [];
     const recs = cat.recommendations.slice(0, 3);
 
-    if (agodaPicks.length > 0) {
+    // Once the traveller has both said they're purchase-ready AND singled out a specific
+    // hotel by name, re-printing the full 3-option list (often with a freshly re-ranked,
+    // different-looking set of picks) is noise — they've already decided. Just confirm
+    // and let the separate booking-link follow-up do its job.
+    const chosenForConfirm =
+      matched?.chosenHotelOverride ??
+      (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined);
+
+    if (purchaseReady && chosenForConfirm) {
+      lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
+    } else if (agodaPicks.length > 0) {
       // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
       // either a live Agoda price (Stage B has run) or a static database estimate.
       agodaPicks.forEach((pick, i) => {
@@ -875,7 +885,10 @@ function buildReply(
         // saying something unhelpful.
         let priceStr = "";
         if (pick.liveDailyRate !== undefined) {
-          priceStr = ` · ${pick.liveCurrency ?? pick.currency ?? "USD"} ${pick.liveDailyRate.toFixed(0)}/night (live)`;
+          // "sell exclusive" per Agoda's affiliate API spec — this is NOT the final,
+          // tax/fee-inclusive price shown at agoda.com checkout, which typically runs
+          // higher. Said explicitly here rather than implying it's the final total.
+          priceStr = ` · ${pick.liveCurrency ?? pick.currency ?? "USD"} ${pick.liveDailyRate.toFixed(0)}/night (live, excl. taxes & fees)`;
         } else if (pick.approxRatePerNight !== null) {
           priceStr = ` · ~${pick.currency ?? "USD"} ${pick.approxRatePerNight.toFixed(0)}/night (est.)`;
         }
