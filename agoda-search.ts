@@ -429,25 +429,41 @@ export async function fetchLiveAgodaPrices(
 ): Promise<HotelPick[]> {
   if (picks.length === 0) return picks;
 
-  let live: AgodaSearchResult[];
-  try {
-    live = await searchHotelsByIds({
-      hotelIds: picks.map((p) => p.hotelId),
-      checkInDate: params.checkinDate,
-      checkOutDate: params.checkoutDate,
-      adults: params.adults ?? 2,
-      children: params.children ?? 0,
-    });
-  } catch (err) {
-    console.error(`[agoda-search] live price fetch failed:`, err instanceof Error ? err.message : err);
-    return picks;
-  }
+  // Individual per-hotel calls (in parallel), not one batched multi-ID request. Real
+  // logs showed a batched 3-hotel-ID call return 0/3 live prices twice in a row, then an
+  // individual single-ID call for one of those SAME hotels succeed moments later — strong
+  // evidence the batched form is the unreliable one, not genuine unavailability. Each
+  // hotel also gets one retry after a short delay, since a single empty result can still
+  // be a transient blip on Agoda's side.
+  const results = await Promise.all(
+    picks.map(async (pick): Promise<AgodaSearchResult | null> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const live = await searchHotelsByIds({
+            hotelIds: [pick.hotelId],
+            checkInDate: params.checkinDate,
+            checkOutDate: params.checkoutDate,
+            adults: params.adults ?? 2,
+            children: params.children ?? 0,
+          });
+          if (live.length > 0) return live[0];
+        } catch (err) {
+          console.error(
+            `[agoda-search] live price fetch failed for hotel ${pick.hotelId} (attempt ${attempt + 1}):`,
+            err instanceof Error ? err.message : err
+          );
+        }
+        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      return null;
+    })
+  );
 
-  console.log(`[agoda-search] Stage B: fetched live prices for ${live.length}/${picks.length} picks`);
+  const found = results.filter((r) => r !== null).length;
+  console.log(`[agoda-search] Stage B: fetched live prices for ${found}/${picks.length} picks`);
 
-  const byId = new Map(live.map((r) => [r.hotelId, r]));
-  return picks.map((pick) => {
-    const l = byId.get(pick.hotelId);
+  return picks.map((pick, i) => {
+    const l = results[i];
     if (!l) return pick;
     return {
       ...pick,

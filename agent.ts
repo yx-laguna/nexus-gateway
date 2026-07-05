@@ -870,16 +870,17 @@ function buildReply(
       // either a live Agoda price (Stage B has run) or a static database estimate.
       agodaPicks.forEach((pick, i) => {
         const distanceStr = pick.distanceKm !== null ? ` · ${pick.distanceKm.toFixed(1)}km away` : "";
-        let priceStr: string;
+        // Never show "price on request" — per explicit request. If neither a live nor a
+        // static estimate is available, just omit the price segment entirely rather than
+        // saying something unhelpful.
+        let priceStr = "";
         if (pick.liveDailyRate !== undefined) {
-          priceStr = `${pick.liveCurrency ?? pick.currency ?? "USD"} ${pick.liveDailyRate.toFixed(0)}/night (live)`;
+          priceStr = ` · ${pick.liveCurrency ?? pick.currency ?? "USD"} ${pick.liveDailyRate.toFixed(0)}/night (live)`;
         } else if (pick.approxRatePerNight !== null) {
-          priceStr = `~${pick.currency ?? "USD"} ${pick.approxRatePerNight.toFixed(0)}/night (est.)`;
-        } else {
-          priceStr = "price on request";
+          priceStr = ` · ~${pick.currency ?? "USD"} ${pick.approxRatePerNight.toFixed(0)}/night (est.)`;
         }
         const ratingStr = pick.starRating ? ` (★${pick.starRating}${pick.reviewScore ? ` · ${pick.reviewScore}/10` : ""})` : "";
-        lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning} · ${priceStr}${distanceStr}${ratingStr}`);
+        lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning}${priceStr}${distanceStr}${ratingStr}`);
         if (i < agodaPicks.length - 1) lines.push(""); // blank line between options, not after the last
       });
     } else {
@@ -891,23 +892,9 @@ function buildReply(
       });
     }
 
-    // Reveal the specific, dated, hotel-tagged Agoda booking link only once the user is
-    // purchase-ready — same "don't push links while browsing" rule as everything else in
-    // this bot. Priority: chosenHotelOverride (a hotel the traveller named that fell
-    // outside the currently active picks, e.g. filtered out by a later budget change —
-    // resolved independently via findHotelPickByName) beats a chosenHotelId match within
-    // agodaPicks, which beats the top-ranked pick if they never singled one out. No
-    // fallback text when a link genuinely isn't available — per explicit request, we
-    // don't repeat a stale "try again in a moment" message; we just omit the line.
-    if (purchaseReady) {
-      const chosen =
-        matched?.chosenHotelOverride ??
-        (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined) ??
-        (agodaPicks.length > 0 ? agodaPicks[0] : undefined);
-      if (chosen?.landingURL) {
-        lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${chosen.landingURL}`);
-      }
-    }
+    // The dedicated Agoda booking link is sent as its OWN follow-up message (see
+    // buildBookingLinkMessage / its call site in _processMessage) — not bundled in here
+    // with the recommendation list, per explicit request.
 
     // Generic Laguna/ACP merchant line — only when an actual merchant was resolved
     // (the hotel branch can return agodaSmart alone with no ACP merchant at all), and
@@ -957,6 +944,35 @@ function buildReply(
   }
 
   return lines.join("\n");
+}
+
+// Builds the dedicated, dated, hotel-tagged Agoda booking link as its OWN message body —
+// sent as a separate follow-up (see _processMessage) rather than bundled into the main
+// recommendation list, per explicit request ("do not include it with the other suggested
+// options. Just give it in a new message"). Same chosen-hotel priority as before:
+// chosenHotelOverride (named hotel resolved outside the active picks, e.g. filtered out by
+// a later budget change) beats a chosenHotelId match within agodaPicks, which beats the
+// top-ranked pick if the traveller never singled one out. Returns null when there's
+// nothing purchase-ready to show yet, or no link is actually available.
+function buildBookingLinkMessage(intent: GoalIntent, enriched: EnrichedCategory[], purchaseReady: boolean): string | null {
+  if (!purchaseReady) return null;
+
+  const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
+  const lines: string[] = [];
+
+  for (const cat of intent.categories.slice(0, 4)) {
+    const matched = enrichedByLabel.get(cat.label);
+    const agodaPicks = matched?.agodaSmart?.picks ?? [];
+    const chosen =
+      matched?.chosenHotelOverride ??
+      (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined) ??
+      (agodaPicks.length > 0 ? agodaPicks[0] : undefined);
+    if (chosen?.landingURL) {
+      lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${chosen.landingURL}`);
+    }
+  }
+
+  return lines.length > 0 ? lines.join("\n\n") : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1099,19 @@ async function _processMessage(
           }).catch((err) => {
             console.error(`[acp] follow-up failed for ${primaryName}:`, err instanceof Error ? err.message : err);
           });
+        }
+
+        // Dedicated Agoda booking link, sent as its OWN separate message rather than
+        // bundled into the reply above — per explicit request. The link data is already
+        // fully resolved (no async job to wait on), so a short delay is enough to make
+        // sure it lands after the main reply rather than racing it.
+        const bookingLinkMsg = buildBookingLinkMessage(intent, enriched, purchaseReady);
+        if (bookingLinkMsg) {
+          setTimeout(() => {
+            onFollowUp(bookingLinkMsg).catch((err) => {
+              console.error(`[agent] booking-link follow-up failed:`, err instanceof Error ? err.message : err);
+            });
+          }, 600);
         }
       }
 
