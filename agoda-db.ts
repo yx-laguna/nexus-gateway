@@ -73,15 +73,31 @@ export function isAgodaDbAvailable(): boolean {
   }
 }
 
+// accommodation_type is a comma-separated tag list (e.g. "Hotel, Resort", "Serviced
+// apartment, Serviced apartment"). Filtering for real hotels ("Hotel" as one of the tags)
+// belongs IN this query, not after fetching — a real city has thousands of small
+// guesthouses/B&Bs/apartments that legitimately out-rate big-brand hotels on
+// rating_average (easier to keep a 9.6+ average with a handful of reviews than with
+// thousands), so cutting to a fixed LIMIT before restricting to real hotels crowds
+// genuine 5-star chains out of the pool entirely. Confirmed on real data: of Bangkok's
+// unfiltered top-500-by-rating rows, only 59 were actually hotel-type — Hotel Nikko
+// Bangkok, Bangkok Marriott Hotel Sukhumvit, and multiple Autograph Collection
+// properties (all rating_average 8.9-9.1, all genuinely 5-star) were pushed out by
+// smaller non-hotel listings rated 9.6+.
+const HOTEL_TYPE_SQL =
+  `(accommodation_type = 'Hotel' OR accommodation_type LIKE 'Hotel,%' OR ` +
+  `accommodation_type LIKE '%, Hotel' OR accommodation_type LIKE '%, Hotel,%')`;
+
 /**
- * Local-first hotel search — all hotels in a city, ordered by rating, no live API call.
- * Used by agoda-search.ts's Stage A (searchLocalHotels) to build a candidate pool that gets
- * distance/budget filtered and Kimi-ranked before ever touching the live Agoda API.
+ * Local-first hotel search — real hotels only (see HOTEL_TYPE_SQL) in a city, ordered by
+ * rating, no live API call. Used by agoda-search.ts's Stage A (searchLocalHotels) to build
+ * a candidate pool that gets distance/budget filtered and Kimi-ranked before ever touching
+ * the live Agoda API.
  */
 export function searchHotelsByCityId(cityId: number, limit = 500): HotelRow[] {
   const db = getDb();
   const stmt = db.prepare(
-    `SELECT * FROM hotels WHERE city_id = ? ORDER BY rating_average DESC, number_of_reviews DESC LIMIT ?`
+    `SELECT * FROM hotels WHERE city_id = ? AND ${HOTEL_TYPE_SQL} ORDER BY rating_average DESC, number_of_reviews DESC LIMIT ?`
   );
   return stmt.all(cityId, limit) as unknown as HotelRow[];
 }
