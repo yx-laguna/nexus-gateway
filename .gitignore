@@ -11,5 +11,7 @@ agoda_hotels.sqlite
 agoda_city_lookup.json
 
 # Retail product catalog (Shopee/iHerb) — same reasoning, see product-db.ts and
-# scripts/build-products-db.py. Currently ~170MB.
+# product-refresh.ts. Auto-rebuilt in production; not committed. The .meta.json
+# sidecar tracks the last refresh timestamp/row counts (see product-refresh.ts).
 products.sqlite
+products.sqlite.meta.json

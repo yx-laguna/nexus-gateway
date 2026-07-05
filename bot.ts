@@ -22,6 +22,7 @@ import { Bot, GrammyError, HttpError, type Context } from "grammy";
 import { processMessage, clearHistory } from "./agent.js";
 import { getDashboard } from "./laguna.js";
 import { initAcp } from "./acp.js";
+import { scheduleDailyProductRefresh } from "./product-refresh.js";
 
 // ---------------------------------------------------------------------------
 // Env check
@@ -497,4 +498,10 @@ server.listen(PORT, async () => {
   initAcp().catch((err) =>
     console.error("[acp] init failed:", err instanceof Error ? err.message : err)
   );
+
+  // Bootstrap/refresh the retail product catalog in the background — see
+  // product-refresh.ts. Never blocks startup; product search just falls back
+  // to "no local catalog" (existing graceful-degrade path) until the first
+  // refresh completes.
+  scheduleDailyProductRefresh();
 });

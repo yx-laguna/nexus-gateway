@@ -70,6 +70,27 @@ export function isProductsDbAvailable(): boolean {
   }
 }
 
+/**
+ * Close the cached read-only handle and forget any cached lookups, so the next
+ * query re-opens PRODUCTS_DB_PATH from disk. Called by product-refresh.ts right
+ * after it atomically swaps a freshly-rebuilt file into place — without this,
+ * this process would keep querying the old (now-unlinked-by-rename) inode
+ * forever, since node:sqlite doesn't watch the file for changes on its own.
+ */
+export function reopenProductsDb(): void {
+  if (_db) {
+    try {
+      _db.close();
+    } catch (err) {
+      console.warn(`[product-db] error closing stale handle (ignoring):`, err instanceof Error ? err.message : err);
+    }
+  }
+  _db = null;
+  _openFailed = false;
+  catalogCache.clear();
+  console.log(`[product-db] reopened — will re-read ${DB_PATH} on next query`);
+}
+
 // Cache hasLocalCatalog results — this gets checked on every message for every
 // category, and the underlying table never changes within a process lifetime
 // (a rebuild+redeploy would restart the process anyway).
