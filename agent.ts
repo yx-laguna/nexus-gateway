@@ -1099,9 +1099,8 @@ function buildReply(
       lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
     } else if (chosenProductPick) {
       anyProductChosenThisTurn = true;
-      // No ACP mint / Involve Asia wrapping here — Shopee isn't set up as an Involve Asia
-      // offer yet (see project memory), and Laguna's own "shopee" merchant is an unrelated,
-      // broken network. Just the real, raw product URL so they can actually go buy it.
+      // Mirrors the hotel branch: confirm here, actual link (minted via ACP where possible,
+      // see buildProductLinkMessage) arrives as its own separate follow-up message.
       const price = chosenProductPick.salePrice ?? chosenProductPick.price;
       let priceStr = "";
       if (price !== null) {
@@ -1109,9 +1108,7 @@ function buildReply(
           chosenProductPick.salePrice !== null && chosenProductPick.price !== null && chosenProductPick.salePrice < chosenProductPick.price;
         priceStr = ` · ${chosenProductPick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${chosenProductPick.currency ?? ""} ${chosenProductPick.price!.toFixed(2)})` : ""}`;
       }
-      lines.push(`Got it — *${chosenProductPick.title}*${priceStr}. Here's the direct link:`);
-      lines.push(chosenProductPick.productUrl ?? "_(no direct link on file for this one — sorry!)_");
-      lines.push(`\n_Direct link for now — cashback tracking isn't set up for Shopee/iHerb yet 🚧_`);
+      lines.push(`Got it — *${chosenProductPick.title}*${priceStr}. Sending the link next! 🔗`);
     } else if (productPicks.length > 0) {
       // Real Shopee/iHerb picks from our own catalog — grounded facts, not LLM guesses.
       // Raw product_url shown directly (no ACP mint / affiliate wrapping yet — discovery
@@ -1272,6 +1269,66 @@ async function buildBookingLinkMessage(
   return lines.length > 0 ? lines.join("\n\n") : null;
 }
 
+// Builds the ACP-minted link for whichever product the shopper has singled out this turn
+// (chosen_product_text -> chosenProductKey/chosenProductOverride, same resolution as
+// buildReply's chosenProductPick) — sent as its own follow-up message, mirroring
+// buildBookingLinkMessage's pattern for hotels. Deliberately NOT gated on purchase_ready:
+// naming a product keeps purchase_ready:false for retail by design (see extractIntent's
+// prompt), but the shopper still wants a real link the moment they name something.
+//
+// Explicit user request (2026-07-05): mint via the same generic ACP mint_link path every
+// other merchant uses — NOT an Involve Asia call (Shopee isn't set up as an Involve Asia
+// offer yet). CAVEAT carried over from earlier research: Laguna's own "shopee" merchant was
+// found to route through an unrelated ad network (chinesean.com) that ignored geo/target_url
+// in testing — so this mint may not actually come back pointed at this exact product. Falls
+// back to the raw, definitely-correct product_url on any mint failure or if the merchant
+// isn't recognised — a link that's certain to work beats one that might not — and labels
+// which case happened so it's obvious from the reply alone, not just the logs.
+async function buildProductLinkMessage(
+  intent: GoalIntent,
+  enriched: EnrichedCategory[],
+  walletAddress: string
+): Promise<string | null> {
+  const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
+  const lines: string[] = [];
+
+  for (const cat of intent.categories.slice(0, 4)) {
+    const matched = enrichedByLabel.get(cat.label);
+    const productPicks = matched?.productSearch?.picks ?? [];
+    const chosen =
+      matched?.chosenProductOverride ??
+      (matched?.chosenProductKey != null
+        ? productPicks.find((p) => `${p.merchant}:${p.productId}` === matched.chosenProductKey)
+        : undefined);
+    if (!chosen?.productUrl) continue;
+
+    let link = chosen.productUrl;
+    let mintedOk = false;
+    try {
+      const minted = await acpMintLink({
+        merchant_id: chosen.merchant,
+        target_url: chosen.productUrl,
+        geo: intent.geo,
+        caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
+        wallet_address: walletAddress || undefined,
+      });
+      if (minted.shortlink) {
+        link = minted.shortlink;
+        mintedOk = true;
+      }
+    } catch (err) {
+      console.error(`[agent] ACP mint_link failed for ${chosen.merchant} product, falling back to raw product_url:`, err instanceof Error ? err.message : err);
+    }
+    lines.push(
+      mintedOk
+        ? `→ *${chosen.title}*: ${link}`
+        : `→ *${chosen.title}* (mint unavailable for ${chosen.merchant} right now — here's the direct link instead): ${link}`
+    );
+  }
+
+  return lines.length > 0 ? lines.join("\n\n") : null;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1409,6 +1466,16 @@ async function _processMessage(
           })
           .catch((err) => {
             console.error(`[agent] booking-link follow-up failed:`, err instanceof Error ? err.message : err);
+          });
+
+        // Same idea for a singled-out product — not gated on purchase_ready (see
+        // buildProductLinkMessage's comment for why).
+        buildProductLinkMessage(intent, enriched, walletAddress)
+          .then((productLinkMsg) => {
+            if (productLinkMsg) return onFollowUp(productLinkMsg);
+          })
+          .catch((err) => {
+            console.error(`[agent] product-link follow-up failed:`, err instanceof Error ? err.message : err);
           });
       }
 
