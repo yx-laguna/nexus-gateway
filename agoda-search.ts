@@ -155,6 +155,25 @@ async function estimateCoordinates(placeName: string, cityName: string, country:
 }
 
 // ---------------------------------------------------------------------------
+// Airside transit lounges / day-use facilities (e.g. "Ambassador Transit
+// Lounge - T3, Singapore Changi Airport (AIRSIDE)", "Changi Transit Hotel
+// Terminal 1") are tagged accommodation_type: "Hotel" in the CSV and read
+// like normal hotels, but they're not standard overnight-bookable stays —
+// confirmed by calling Agoda's live hotelId search directly for a few of
+// these: it returns nothing for them (no error, just absent from results),
+// while a real airport hotel a few km away returns a normal live rate. They'd
+// always show "price on request" and can never get a real booking link, so
+// keep them out of the candidate pool entirely rather than recommend a dead
+// end.
+// ---------------------------------------------------------------------------
+
+const NON_BOOKABLE_RE = /\btransit\s+lounge\b|\bairside\b|\btransit\s+hotel\b/i;
+
+function isLikelyNonBookable(row: HotelRow): boolean {
+  return NON_BOOKABLE_RE.test(row.hotel_name ?? "") || NON_BOOKABLE_RE.test(row.overview ?? "");
+}
+
+// ---------------------------------------------------------------------------
 // Stage A — local DB search, no live API call
 // ---------------------------------------------------------------------------
 
@@ -174,6 +193,16 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
   let rows = searchHotelsByCityId(resolvedCity.city_id, 500);
   if (rows.length === 0) {
     console.log(`[agoda-search] 0 local rows for ${resolvedCity.city} (${resolvedCity.city_id})`);
+    return null;
+  }
+
+  const beforeFilter = rows.length;
+  rows = rows.filter((r) => !isLikelyNonBookable(r));
+  if (rows.length < beforeFilter) {
+    console.log(`[agoda-search] filtered out ${beforeFilter - rows.length} transit-lounge/airside listing(s)`);
+  }
+  if (rows.length === 0) {
+    console.log(`[agoda-search] 0 local rows left for ${resolvedCity.city} (${resolvedCity.city_id}) after transit-lounge filter`);
     return null;
   }
 
