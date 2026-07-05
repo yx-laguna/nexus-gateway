@@ -205,6 +205,20 @@ async function _acpMintLink(params: {
   if (params.geo) requirement.geo = params.geo.toUpperCase();
   if (params.caller_tag) requirement.caller_tag = params.caller_tag;
   if (params.wallet_address) requirement.wallet_address = params.wallet_address;
+  // BUG FIX (2026-07-05): target_url was accepted as a parameter and threaded through
+  // every call site (buildBookingLinkMessage, buildProductLinkMessage) but was never
+  // actually added to the requirement object sent to createJobFromOffering — meaning
+  // every mint_link job silently went out WITHOUT it, regardless of caller intent. On
+  // the bridge side (ACPLagunaTranslator's mint-affiliate-link.ts), the Agoda deep-link
+  // special case checks `req.target_url !== undefined` to decide whether to call
+  // Involve Asia's real deep-link API for a dated, hotel-specific link — since
+  // target_url never arrived, that check was always false, so every Agoda mint fell
+  // through to Laguna's own generic mintLink() (a non-hotel-specific, non-dated
+  // shortlink) instead. Confirmed live: a minted booking link for St. Giles Southkey
+  // actually 404'd when followed. This is exactly why "book <hotel>" never produced a
+  // real dated Agoda link even though the ACP job itself completed successfully every
+  // time — the deliverable was for the wrong (generic) link the whole time.
+  if (params.target_url) requirement.target_url = params.target_url;
 
   let jobId!: bigint;
   try {
