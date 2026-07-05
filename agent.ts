@@ -745,7 +745,7 @@ function buildReply(
       // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
       // either a live Agoda price (Stage B has run) or a static database estimate.
       agodaPicks.forEach((pick, i) => {
-        const distanceStr = pick.distanceKm !== null ? ` · ${pick.distanceKm}km away` : "";
+        const distanceStr = pick.distanceKm !== null ? ` · ${pick.distanceKm.toFixed(1)}km away` : "";
         let priceStr: string;
         if (pick.liveDailyRate !== undefined) {
           anyLivePrice = true;
