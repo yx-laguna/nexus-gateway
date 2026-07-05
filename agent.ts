@@ -36,14 +36,29 @@ import { z } from "zod";
 const sessions = new Map<number, ChatMessage[]>();
 
 // Remembers each user's last hotel search (Stage A local picks + the search
-// params used) so a later "check real prices for these" doesn't need the
-// user to repeat the city/dates — Stage B just needs the hotel IDs.
+// params used) so a later "check real prices for these" or "get prices for
+// these 3 hotels" reuses the SAME picks instead of silently re-searching.
+//
+// Bug this fixes: canSearch (destination_city + checkin + checkout all known)
+// stays true for basically the entire conversation once established, because
+// extractIntent re-derives those fields from history every turn. That meant
+// every follow-up — even ones with no new location/preference info, like
+// "get prices for these 3 hotels" — re-ran Stage A from scratch. If that
+// turn's message had no location cue, hotel_preference_text came back empty,
+// geocoding never ran, and Stage A silently fell back to the same generic
+// top-rated-by-rating list every ungeocoded search returns — then fetched
+// live prices for THOSE hotels, not the ones the user was actually looking
+// at. Now we only re-search when the destination, dates, or preference text
+// actually changed from the stored search; otherwise we reuse it as-is.
 interface StoredHotelSearch {
   result: LocalSearchResult;
+  cityQuery: string;
   checkinDate: string;
   checkoutDate: string;
   adults: number;
   children: number;
+  preferenceText?: string;
+  budgetMaxPerNight?: number;
 }
 const lastHotelSearch = new Map<number, StoredHotelSearch>();
 
@@ -411,7 +426,28 @@ async function runTools(
         const canSearch = !!(intent.destination_city && intent.checkin_date && intent.checkout_date);
         const stored = lastHotelSearch.get(userId);
 
-        const localSearchPromise: Promise<LocalSearchResult | null> = canSearch
+        // Only treat this as a genuinely NEW search if this turn actually SAID something
+        // that differs from the stored search — a different city, different dates, a new
+        // preference/budget. Crucially: if this turn's extraction came back null for a
+        // field (e.g. hotel_preference_text, because the message was "get prices for these
+        // 3 hotels" with no location cue in it), that must NOT count as "changed" — it just
+        // means the user didn't repeat themselves, and we should keep using what we already
+        // had rather than silently re-searching without it (which is what produced a
+        // different, ungeocoded, generic set of hotels than the ones actually being
+        // discussed).
+        const cityChanged = !!intent.destination_city && intent.destination_city !== stored?.cityQuery;
+        const datesChanged =
+          (!!intent.checkin_date && intent.checkin_date !== stored?.checkinDate) ||
+          (!!intent.checkout_date && intent.checkout_date !== stored?.checkoutDate);
+        const preferenceChanged =
+          !!intent.hotel_preference_text && intent.hotel_preference_text !== stored?.preferenceText;
+        const budgetChanged =
+          intent.budget_max_per_night != null && intent.budget_max_per_night !== stored?.budgetMaxPerNight;
+
+        const shouldSearch =
+          canSearch && (!stored || cityChanged || datesChanged || preferenceChanged || budgetChanged);
+
+        const localSearchPromise: Promise<LocalSearchResult | null> = shouldSearch
           ? searchLocalHotels({
               cityQuery: intent.destination_city!,
               checkinDate: intent.checkin_date!,
@@ -425,9 +461,10 @@ async function runTools(
               console.error(`[agent] searchLocalHotels failed:`, err instanceof Error ? err.message : err);
               return null;
             })
-          // No fresh destination/dates this turn — if the user's asking about prices/the
-          // link for hotels we already found, reuse that search instead of coming up empty.
-          : Promise.resolve((intent.wants_realtime_prices || mintLinks) && stored ? stored.result : null);
+          // Nothing material changed this turn — if we have a stored search, always reuse it
+          // (regardless of wants_realtime_prices/mintLinks) so "these 3 hotels" keeps meaning
+          // the same 3 hotels. Only fall through to null if we truly have nothing yet.
+          : Promise.resolve(stored ? stored.result : null);
 
         const [tripResult, agodaResult, localSearchResult] = await Promise.allSettled([
           resolveMerchant("trip-com", intent.geo),
@@ -459,17 +496,22 @@ async function runTools(
           }
         }
 
-        // Remember this search (with whatever live data we now have) for a later turn.
+        // Remember this search (with whatever live data we now have) for a later turn —
+        // including the params that decide whether a future turn can reuse it as-is.
         if (agodaSmart) {
           const ci = intent.checkin_date ?? stored?.checkinDate;
           const co = intent.checkout_date ?? stored?.checkoutDate;
-          if (ci && co) {
+          const city = intent.destination_city ?? stored?.cityQuery;
+          if (ci && co && city) {
             lastHotelSearch.set(userId, {
               result: agodaSmart,
+              cityQuery: city,
               checkinDate: ci,
               checkoutDate: co,
               adults: intent.adults ?? stored?.adults ?? 2,
               children: intent.children ?? stored?.children ?? 0,
+              preferenceText: (intent.hotel_preference_text ?? stored?.preferenceText) ?? undefined,
+              budgetMaxPerNight: (intent.budget_max_per_night ?? stored?.budgetMaxPerNight) ?? undefined,
             });
           }
         }
@@ -688,10 +730,6 @@ function buildReply(
     lines.push(`Here are some options for *${intent.goal}*!\n`);
   }
 
-  let totalCashback = 0;
-  let anyEstimate = false;
-  const cashbackBreakdown: string[] = [];
-
   for (const cat of intent.categories.slice(0, 4)) {
     const emoji = emojiFor(cat.label);
     const matched = enrichedByLabel.get(cat.label);
@@ -749,31 +787,18 @@ function buildReply(
 
     if (hasMerchant) {
       const primaryName = matched!.info?.name ?? matched!.info?.id ?? cat.label;
-      const primaryRate = extractRate(matched!.info);
-      const fmtRate = (r: ReturnType<typeof extractRate>) => r ? ` (${(r.rate * 100).toFixed(0)}% rebate)` : "";
 
-      // Build one clean booking line
+      // Build one clean booking line — no merchant-specific rebate % shown here anymore;
+      // see the generic cashback line appended once at the end of the reply instead.
       if (matched!.link?.shortlink) {
-        lines.push(`→ Book via *${primaryName}*${fmtRate(primaryRate)}: ${matched!.link.shortlink}`);
+        lines.push(`→ Book via *${primaryName}*: ${matched!.link.shortlink}`);
       } else if (matched!.acpJob) {
         // Extra platforms inline (e.g. "also on Agoda")
         const extras = (matched!.extraPlatforms ?? []).map(ep => ep.name).join(" & ");
         const alsoStr = extras ? ` (also on ${extras})` : "";
-        lines.push(`→ We recommend booking via *${primaryName}*${fmtRate(primaryRate)}${alsoStr} — _affiliate link coming shortly_ ⏳`);
+        lines.push(`→ We recommend booking via *${primaryName}*${alsoStr} — _affiliate link coming shortly_ ⏳`);
       } else {
-        lines.push(`→ via *${primaryName}*${fmtRate(primaryRate)}`);
-      }
-
-      // Cashback calc on primary
-      if (primaryRate) {
-        const pick = recs[0] ?? "";
-        const price = extractPrice(pick);
-        if (price) {
-          const cashback = price * primaryRate.rate;
-          totalCashback += cashback;
-          if (primaryRate.isEstimate) anyEstimate = true;
-          cashbackBreakdown.push(`${primaryName} ${(primaryRate.rate * 100).toFixed(0)}% × $${price} = $${cashback.toFixed(2)}`);
-        }
+        lines.push(`→ via *${primaryName}*`);
       }
     } else if (agodaPicks.length === 0) {
       // Nothing resolved at all for this category — no merchant, no real search results.
@@ -784,25 +809,11 @@ function buildReply(
   }
 
   if (purchaseReady) {
-    // Show cashback footer only when minting links
-    if (totalCashback > 0.005) {
-      const estLabel = anyEstimate ? "est. " : "";
-      lines.push(
-        `_Book through these links and receive ${estLabel}*$${totalCashback.toFixed(2)} USDC* in rebate 💸_\n` +
-        `_↳ ${cashbackBreakdown.join(" · ")}_`
-      );
-    } else {
-      const rateItems = enriched
-        .filter((e) => e.acpJob || e.link?.shortlink)
-        .map((e) => {
-          const r = extractRate(e.info);
-          return r ? `${e.info?.name ?? e.label} (${(r.rate * 100).toFixed(0)}%)` : null;
-        })
-        .filter(Boolean)
-        .slice(0, 3);
-      if (rateItems.length > 0) {
-        lines.push(`_Book through these links and earn USDC rebates — ${rateItems.join(", ")} 💸_`);
-      }
+    // Generic cashback line — no merchant-specific rate/dollar breakdown anymore, just
+    // one consistent line whenever at least one bookable link exists.
+    const hasAnyLink = enriched.some((e) => e.acpJob || e.link?.shortlink);
+    if (hasAnyLink) {
+      lines.push(`_Receive up to 6% in cashback when you book via our link 💸_`);
     }
   } else {
     // Browsing mode — soft close, invite them to pick
@@ -920,8 +931,6 @@ async function _processMessage(
       if (onFollowUp) {
         for (const cat of enriched) {
           const primaryName = cat.info?.name ?? cat.info?.id ?? cat.label;
-          const primaryRate = extractRate(cat.info);
-          const rateStr = primaryRate ? ` · *${(primaryRate.rate * 100).toFixed(0)}% rebate*` : "";
 
           // If there are extra platforms (agoda + trip), bundle all links into one message
           const extraJobs = (cat.extraPlatforms ?? []).filter(ep => ep.acpJob);
@@ -936,14 +945,13 @@ async function _processMessage(
           Promise.allSettled(allJobs.map(j => j.job)).then((results) => {
             const linkLines: string[] = [];
             results.forEach((r, i) => {
-              const { name, info } = allJobs[i];
-              const rate = extractRate(info);
-              const rs = rate ? ` · ${(rate.rate * 100).toFixed(0)}% rebate` : "";
+              const { name } = allJobs[i];
               if (r.status === "fulfilled") {
-                linkLines.push(`🔗 *${name}*${rs}\n${r.value.shortlink}`);
+                linkLines.push(`🔗 *${name}*\n${r.value.shortlink}`);
               }
             });
             if (linkLines.length > 0) {
+              linkLines.push(`_Receive up to 6% in cashback when you book via our link 💸_`);
               return onFollowUp(linkLines.join("\n\n"));
             }
           }).catch((err) => {

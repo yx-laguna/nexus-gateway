@@ -37,12 +37,21 @@ import { searchHotelsByCityId, isAgodaDbAvailable, type HotelRow } from "./agoda
 // call) already ate most of that budget, a slow ranking call won't fail fast
 // enough to fall back within the time the user is actually waiting — the
 // outer pipeline gives up first and the graceful fallback never gets a
-// chance to return. Give these two calls their own short leash so a slow
-// Kimi response degrades to real (unranked) DB results instead of the
-// generic "took too long" message.
+// chance to return. Give these two calls their own leash so a slow Kimi
+// response degrades to real (unranked) DB results instead of the generic
+// "took too long" message.
+//
+// NOTE: an earlier version set both to 8s. Real logs showed the ranking call
+// (it ships ~40 candidates as JSON and asks for 3 picks + reasoning — a much
+// bigger prompt than the geocode call) missed 8s on every single request,
+// so ranking was effectively disabled and every reply fell back to the
+// generic "Top-rated option in the area" text. Geocoding's own timeout can
+// stay short (it reliably resolves or declines within a few seconds);
+// ranking needs more room to actually produce tailored picks.
 // ---------------------------------------------------------------------------
 
-const STAGE_A_KIMI_TIMEOUT_MS = 8_000;
+const STAGE_A_GEOCODE_TIMEOUT_MS = 10_000;
+const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -133,7 +142,7 @@ async function estimateCoordinates(placeName: string, cityName: string, country:
   ];
 
   try {
-    const raw = await withTimeout(chat(prompt, true), STAGE_A_KIMI_TIMEOUT_MS, "geocode estimate");
+    const raw = await withTimeout(chat(prompt, true), STAGE_A_GEOCODE_TIMEOUT_MS, "geocode estimate");
     const parsed = JSON.parse(raw) as { lat: number | null; lon: number | null };
     if (typeof parsed.lat === "number" && typeof parsed.lon === "number") {
       return { lat: parsed.lat, lon: parsed.lon };
@@ -261,7 +270,7 @@ export async function searchLocalHotels(params: LocalSearchParams): Promise<Loca
 
   let picks: HotelPick[] = [];
   try {
-    const raw = await withTimeout(chat(rankingPrompt, true), STAGE_A_KIMI_TIMEOUT_MS, "hotel ranking");
+    const raw = await withTimeout(chat(rankingPrompt, true), STAGE_A_RANKING_TIMEOUT_MS, "hotel ranking");
     const parsed = JSON.parse(raw) as { picks?: Array<{ hotel_id: number; reasoning: string }> };
     const byId = new Map(scored.map(({ row, distanceKm }) => [row.hotel_id, { row, distanceKm }]));
 
