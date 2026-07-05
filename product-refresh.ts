@@ -442,15 +442,27 @@ export function scheduleDailyProductRefresh(): void {
   const dbMissing = !existsSync(DB_PATH);
   const meta = readMeta();
   const elapsed = meta ? Date.now() - meta.lastRefreshedAt : Infinity;
-  const dueNow = dbMissing || !meta || elapsed >= ONE_DAY_MS;
+
+  // Adding a new SHOPEE_FEED_URL_*/IHERB_FEED_URL_* env var always restarts this
+  // process (Render restarts on env var changes), but the existing catalog is
+  // still fresh — without this check, a newly-added country would silently wait
+  // up to 24h before its first ingest instead of showing up on the very next
+  // deploy, which isn't what "just add the env var" should feel like.
+  const configuredKeys = new Set(sources.map((s) => `${s.merchant}:${s.country}`));
+  const knownKeys = new Set(Object.keys(meta?.sources ?? {}));
+  const newSourceKeys = [...configuredKeys].filter((k) => !knownKeys.has(k));
+
+  const dueNow = dbMissing || !meta || elapsed >= ONE_DAY_MS || newSourceKeys.length > 0;
   const initialDelay = dueNow ? 0 : ONE_DAY_MS - elapsed;
 
   console.log(
     dbMissing
       ? "[product-refresh] no catalog on disk yet — bootstrapping now (first boot on this disk)"
-      : dueNow
-        ? "[product-refresh] catalog is stale — refreshing now"
-        : `[product-refresh] catalog is fresh — next refresh in ${(initialDelay / 3_600_000).toFixed(1)}h`
+      : newSourceKeys.length > 0
+        ? `[product-refresh] new feed source(s) configured since last refresh (${newSourceKeys.join(", ")}) — refreshing now`
+        : dueNow
+          ? "[product-refresh] catalog is stale — refreshing now"
+          : `[product-refresh] catalog is fresh — next refresh in ${(initialDelay / 3_600_000).toFixed(1)}h`
   );
 
   const run = () => {
