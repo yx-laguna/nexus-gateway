@@ -27,7 +27,6 @@ import {
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
 import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
-import { mintAgodaDeepLink } from "./involve-asia.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -1029,11 +1028,12 @@ function buildReply(
 // top-ranked pick if the traveller never singled one out. Returns null when there's
 // nothing purchase-ready to show yet, or no link is actually available.
 //
-// Before handing back chosen.landingURL as-is, wraps it through Involve Asia's deeplink
-// generator (mintAgodaDeepLink) so the click is attributable to the traveller's wallet —
-// verified live that this preserves the exact hotel/dates end to end (unlike Laguna's own
-// mint_link, which silently drops target_url for Agoda). Falls back to the raw landingURL
-// on any failure — a working link always beats no link.
+// Before handing back chosen.landingURL as-is, routes it through the ACP bridge's
+// mint_link offering (merchant_id="agoda", target_url=chosen.landingURL) so the deep-link
+// wrapping (Involve Asia under the hood) and wallet-level cashback tracking both happen at
+// the ACP Laguna layer — one unified path so cashback checking/withdrawal-by-agents works
+// the same way for hotels as for every other merchant. Falls back to the raw landingURL on
+// any failure — a working link always beats no link.
 async function buildBookingLinkMessage(
   intent: GoalIntent,
   enriched: EnrichedCategory[],
@@ -1053,29 +1053,19 @@ async function buildBookingLinkMessage(
       (matched?.chosenHotelId != null ? agodaPicks.find((p) => p.hotelId === matched.chosenHotelId) : undefined) ??
       (agodaPicks.length > 0 ? agodaPicks[0] : undefined);
     if (chosen?.landingURL) {
-      // Pull checkin/checkout straight from the landingURL's own query params rather
-      // than intent.checkin_date/checkout_date — those can be null on a turn that
-      // reused a stored search, but the link itself always has the real dates baked
-      // in already. Only used for cache-key precision and aff_sub reporting metadata;
-      // the actual booking destination comes from landingURL regardless.
-      let ci = "";
-      let co = "";
+      let bookingUrl = chosen.landingURL;
       try {
-        const u = new URL(chosen.landingURL);
-        ci = u.searchParams.get("checkin") ?? "";
-        co = u.searchParams.get("checkout") ?? "";
-      } catch {
-        // malformed URL — fall through with empty dates, still cacheable per-wallet/hotel
+        const minted = await acpMintLink({
+          merchant_id: "agoda",
+          target_url: chosen.landingURL,
+          geo: intent.geo,
+          caller_tag: walletAddress ? `nexus-${walletAddress.slice(2, 8)}` : "nexus",
+          wallet_address: walletAddress || undefined,
+        });
+        if (minted.shortlink) bookingUrl = minted.shortlink;
+      } catch (err) {
+        console.error(`[agent] ACP mint_link failed for agoda deep link, falling back to raw landingURL:`, err instanceof Error ? err.message : err);
       }
-      const bookingUrl = walletAddress
-        ? await mintAgodaDeepLink(chosen.landingURL, {
-            walletAddress,
-            hotelId: chosen.hotelId,
-            hotelName: chosen.hotelName,
-            checkinDate: ci,
-            checkoutDate: co,
-          })
-        : chosen.landingURL;
       lines.push(`→ Book *${chosen.hotelName}* directly on Agoda: ${bookingUrl}`);
     }
   }

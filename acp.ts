@@ -156,6 +156,7 @@ const ACP_TOTAL_TIMEOUT_MS = 120_000; // 2 min hard ceiling — covers browseAge
 
 export async function acpMintLink(params: {
   merchant_id: string;
+  target_url?: string;
   geo?: string | null;
   caller_tag?: string;
   wallet_address?: string;
@@ -171,6 +172,7 @@ export async function acpMintLink(params: {
 
 async function _acpMintLink(params: {
   merchant_id: string;
+  target_url?: string;
   geo?: string | null;
   caller_tag?: string;
   wallet_address?: string;
