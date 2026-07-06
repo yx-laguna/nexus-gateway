@@ -27,8 +27,10 @@ import {
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
 import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
-import { searchLocalProducts, findProductPickByName, type ProductSearchResult, type ProductPick } from "./product-search.js";
+import { searchCombinedProducts, findProductPickByName, platformLabel, type ProductSearchResult, type ProductPick } from "./product-search.js";
 import { hasLocalCatalog } from "./product-db.js";
+import { LAZADA_PRESENCE_COUNTRIES } from "./lazada-search.js";
+import { checkShopeeAlternative } from "./shopee-price-check.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -874,7 +876,19 @@ async function runTools(
         productCandidates.add("shopee");
       }
       const productMerchants = [...productCandidates].filter((p) => hasLocalCatalog(p, intent.geo));
-      if (productMerchants.length > 0) {
+
+      // Lazada (live search, see lazada-search.ts) runs as its own independent
+      // source alongside the local datafeed, gated on the same
+      // isHotel/travel/retail-intent checks as the Shopee-presence check above —
+      // NOT on hasLocalCatalog, since Lazada has no local catalog at all, it's a
+      // live API. Decided 2026-07-06 ("handle both at once ... pick the best from
+      // both searches"): this means the retail branch below now activates even in
+      // a country/category with NO local datafeed coverage at all, as long as
+      // Lazada covers it — see searchCombinedProducts.
+      const lazadaAvailable =
+        !isHotel && !TRAVEL_RE.test(cat.label) && isRetailIntent && !!intent.geo && LAZADA_PRESENCE_COUNTRIES.has(intent.geo.toUpperCase());
+
+      if (productMerchants.length > 0 || lazadaAvailable) {
         const searchKey = `${userId}:${cat.label}`;
         const stored = lastProductSearch.get(searchKey);
         const queryText = intent.product_query ?? stored?.query ?? cat.recommendations[0] ?? cat.label;
@@ -895,7 +909,7 @@ async function runTools(
         let productResult: ProductSearchResult | null = stored?.result ?? null;
         if (shouldSearch) {
           try {
-            productResult = await searchLocalProducts({
+            productResult = await searchCombinedProducts({
               query: queryText,
               country: intent.geo ?? stored?.country ?? "SG",
               merchants: productMerchants,
@@ -908,7 +922,7 @@ async function runTools(
                 intent.wants_different_products && stored ? stored.result.picks.map((p) => p.productId) : undefined,
             });
           } catch (err) {
-            console.error(`[agent] searchLocalProducts failed:`, err instanceof Error ? err.message : err);
+            console.error(`[agent] searchCombinedProducts failed:`, err instanceof Error ? err.message : err);
             productResult = null;
           }
         }
@@ -1166,7 +1180,7 @@ function buildReply(
           chosenProductPick.salePrice !== null && chosenProductPick.price !== null && chosenProductPick.salePrice < chosenProductPick.price;
         priceStr = ` · ${chosenProductPick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${chosenProductPick.currency ?? ""} ${chosenProductPick.price!.toFixed(2)})` : ""}`;
       }
-      lines.push(`Got it — *${chosenProductPick.title}*${priceStr}. Here's the direct link:`);
+      lines.push(`Got it — *${chosenProductPick.title}* (${platformLabel(chosenProductPick.merchant)})${priceStr}. Here's the direct link:`);
       lines.push(chosenProductPick.productUrl ?? "_(no direct link on file for this one — sorry!)_");
     } else if (productPicks.length > 0) {
       // Real Shopee/iHerb picks from our own catalog — grounded facts, not LLM guesses.
@@ -1191,9 +1205,15 @@ function buildReply(
           const wasDiscounted = pick.salePrice !== null && pick.price !== null && pick.salePrice < pick.price;
           priceStr = ` · ${pick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${pick.currency ?? ""} ${pick.price!.toFixed(2)})` : ""}`;
         }
-        const ratingStr = pick.rating ? ` (★${pick.rating}${pick.soldCount ? ` · ${pick.soldCount} sold` : ""})` : "";
+        // reviewCount (Lazada/live-Shopee) is the real signal when we have it; soldCount
+        // (local datafeed's only volume signal) is shown otherwise — see product-ranking.ts.
+        const volumeStr = pick.reviewCount ? ` · ${pick.reviewCount} reviews` : pick.soldCount ? ` · ${pick.soldCount} sold` : "";
+        const ratingStr = pick.rating ? ` (★${pick.rating}${volumeStr})` : "";
         const officialStr = pick.isOfficial ? " ✅ Official Store" : "";
-        lines.push(`${i + 1}. *${pick.title}* — ${pick.reasoning}${priceStr}${ratingStr}${officialStr}`);
+        // Picks can now come from more than one marketplace in the same shortlist (see
+        // searchCombinedProducts) — always say which one, per the decided cross-platform
+        // presentation policy (project memory).
+        lines.push(`${i + 1}. *${pick.title}* (${platformLabel(pick.merchant)}) — ${pick.reasoning}${priceStr}${ratingStr}${officialStr}`);
         if (i < productPicks.length - 1) lines.push("");
       });
       lines.push(`\n_Which one? I'll send the direct link once you pick._`);
@@ -1339,6 +1359,49 @@ async function buildBookingLinkMessage(
 // chosenProductPick branch now shows chosen.productUrl directly instead of deferring to a
 // separate mint-then-follow-up message.
 
+// Commit-time cross-check against Shopee, added 2026-07-06 once Lazada joined the combined
+// search (see project memory "Charted Sea live search eval" — "handle both at once ... only
+// when the shopper says they want this specific product, send the Lazada SKU link, and at the
+// same time check Shopee for a cheaper or similar item"). Runs as its OWN async follow-up,
+// never inline: the shopper already has the Lazada link from the synchronous reply above, and
+// the live Shopee scraper alone can take 2+ minutes (see shopee-live-search.ts) — this is
+// purely additive, never something worth making them wait for.
+//
+// Gated on intent.chosen_product_text being set THIS turn (not on the persisted
+// chosenProductKey/chosenProductOverride on EnrichedCategory, which survive across turns via
+// lastProductSearch) — otherwise this expensive check would re-fire on every single message
+// after a commit, not just the turn the shopper actually named something.
+//
+// Only fires for a Lazada-sourced pick, per the decided design: Shopee/iHerb picks don't get
+// the reverse check (a possible future extension, not built here — out of the explicitly
+// agreed scope for this pass).
+async function buildShopeePriceCheckMessage(intent: GoalIntent, enriched: EnrichedCategory[]): Promise<string | null> {
+  if (!intent.chosen_product_text) return null;
+
+  const enrichedByLabel = new Map(enriched.map((e) => [e.label, e]));
+  const country = intent.geo ?? "SG";
+
+  for (const cat of intent.categories.slice(0, 4)) {
+    const matched = enrichedByLabel.get(cat.label);
+    const productPicks = matched?.productSearch?.picks ?? [];
+    const chosen =
+      matched?.chosenProductOverride ??
+      (matched?.chosenProductKey != null
+        ? productPicks.find((p) => `${p.merchant}:${p.productId}` === matched.chosenProductKey)
+        : undefined);
+
+    if (!chosen || chosen.merchant !== "lazada") continue;
+
+    try {
+      return await checkShopeeAlternative(chosen, country);
+    } catch (err) {
+      console.error(`[agent] Shopee price-check failed for "${chosen.title}":`, err instanceof Error ? err.message : err);
+      return `Checked Shopee for *${chosen.title}* but couldn't get a reliable comparison right now — the Lazada link above is still good to go.`;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1476,6 +1539,17 @@ async function _processMessage(
           })
           .catch((err) => {
             console.error(`[agent] booking-link follow-up failed:`, err instanceof Error ? err.message : err);
+          });
+
+        // Shopee cross-check, fired only the turn the shopper names a specific Lazada
+        // pick — see buildShopeePriceCheckMessage's comment for the full gating logic
+        // and why this is async/separate rather than inline.
+        buildShopeePriceCheckMessage(intent, enriched)
+          .then((priceCheckMsg) => {
+            if (priceCheckMsg) return onFollowUp(priceCheckMsg);
+          })
+          .catch((err) => {
+            console.error(`[agent] Shopee price-check follow-up failed:`, err instanceof Error ? err.message : err);
           });
       }
 

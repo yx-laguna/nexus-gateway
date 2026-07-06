@@ -59,6 +59,11 @@ services:
       - key: IHERB_FEED_URL_PH
         sync: false
 
+      # ── Charted Sea (live Lazada + commit-time live Shopee search — see
+      #    lazada-search.ts, shopee-live-search.ts, shopee-price-check.ts) ─────────
+      - key: CHARTEDSEA_API_TOKEN
+        sync: false          # generate from console.chartedsea.com, paste in Render dashboard
+
       # ── Telegram ─────────────────────────────────────────────────────────────
       - key: TELEGRAM_BOT_TOKEN
         sync: false          # fill in Render dashboard

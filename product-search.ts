@@ -21,10 +21,24 @@
  * of scope for this pass (discovery/recommendation first, monetization once the
  * Shopee/iHerb affiliate mechanics are sorted — see project memory). Picks carry
  * the raw product_url as-is.
+ *
+ * searchLocalProducts above is the original local-only (Shopee/iHerb datafeed)
+ * path. searchCombinedProducts (added 2026-07-06) additionally pools in live
+ * Lazada search results (lazada-search.ts) and is what agent.ts actually calls
+ * today — see its own header comment for why Lazada joins this fast/inline path
+ * while live Shopee search does not.
  */
 
 import { chat, type ChatMessage } from "./broker.js";
 import { searchProductCandidates, searchProductsByTitle, isProductsDbAvailable, type ProductRow } from "./product-db.js";
+import {
+  scoreCandidate,
+  applyHardFilters,
+  shortlist,
+  titleMatchesQuery,
+  type RankableCandidate,
+} from "./product-ranking.js";
+import { searchLazadaProducts, LAZADA_PRESENCE_COUNTRIES } from "./lazada-search.js";
 
 const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 
@@ -54,12 +68,33 @@ export interface ProductPick {
   salePrice: number | null;
   currency: string | null;
   rating: number | null;
+  // True number-of-ratings when the source has one (Lazada, live Shopee search) —
+  // null for anything sourced from the local datafeed, which never carries this
+  // field (see product-ranking.ts). Purely for display; soldCount below is used
+  // wherever reviewCount is null.
+  reviewCount: number | null;
   soldCount: number | null;
   isOfficial: boolean;
   category: string | null;
   productUrl: string | null;
   imageUrl: string | null;
   reasoning: string;
+}
+
+/** Human-readable marketplace label for display — picks can now come from more
+ *  than one platform in the same shortlist (see searchCombinedProducts), so every
+ *  place a pick is shown needs to say which marketplace it's on. */
+export function platformLabel(merchant: string): string {
+  switch (merchant) {
+    case "lazada":
+      return "Lazada";
+    case "shopee":
+      return "Shopee";
+    case "iherb":
+      return "iHerb";
+    default:
+      return merchant;
+  }
 }
 
 export interface ProductSearchResult {
@@ -78,24 +113,6 @@ function effectivePrice(row: ProductRow): number | null {
   return row.sale_price ?? row.price ?? null;
 }
 
-/** True if at least one meaningful (3+ char) query term literally appears in the
- *  product's title — used to filter out FTS matches that only hit via category/
- *  description/brand (see the caller's comment for the real incident this fixes).
- *  Terms shorter than 3 chars are ignored as too noisy to judge relevance by; if a
- *  query has no terms that long, relevance can't be meaningfully checked, so nothing
- *  is filtered out on that basis. */
-function titleMatchesQuery(title: string | null, query: string): boolean {
-  if (!title) return false;
-  const terms = query
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter((t) => t.length >= 3);
-  if (terms.length === 0) return true;
-  const lowerTitle = title.toLowerCase();
-  return terms.some((t) => lowerTitle.includes(t));
-}
-
 function toPick(row: ProductRow, reasoning: string): ProductPick {
   return {
     productId: row.product_id,
@@ -105,11 +122,31 @@ function toPick(row: ProductRow, reasoning: string): ProductPick {
     salePrice: row.sale_price,
     currency: row.currency,
     rating: row.rating,
+    reviewCount: null, // local datafeed never carries a true review count
     soldCount: row.sold_count,
     isOfficial: row.is_official === 1,
     category: row.category,
     productUrl: row.product_url,
     imageUrl: row.image_url,
+    reasoning,
+  };
+}
+
+function candidateToPick(c: RankableCandidate, reasoning: string): ProductPick {
+  return {
+    productId: c.productId,
+    merchant: c.merchant,
+    title: c.title || `${c.merchant} product #${c.productId}`,
+    price: c.price,
+    salePrice: c.salePrice,
+    currency: c.currency,
+    rating: c.rating,
+    reviewCount: c.reviewCount,
+    soldCount: c.soldCount,
+    isOfficial: c.isOfficial,
+    category: c.category,
+    productUrl: c.productUrl,
+    imageUrl: c.imageUrl,
     reasoning,
   };
 }
@@ -268,6 +305,175 @@ export async function searchLocalProducts(params: ProductSearchParams): Promise<
   );
 
   return { query: params.query, country: params.country, candidateCount, picks, isExactMatch };
+}
+
+/**
+ * Combined Lazada (live) + Shopee/iHerb (local datafeed) search — decided
+ * 2026-07-06 (see project memory "Charted Sea live search eval"): every
+ * recommendation turn queries both fast sources in parallel, pools candidates
+ * through the shared scoring formula (product-ranking.ts), and lets Kimi pick 3-5
+ * across BOTH platforms together rather than treating them as separate lists.
+ *
+ * The live Shopee scraper is deliberately NOT part of this path — see
+ * shopee-live-search.ts's header for why (routinely 2+ minutes, real block
+ * failures) — it's reserved for the commit-time-only price-check
+ * (shopee-price-check.ts). Only the free/instant local Shopee datafeed and the
+ * fast/reliable live Lazada search run inline here.
+ */
+export async function searchCombinedProducts(params: ProductSearchParams): Promise<ProductSearchResult | null> {
+  const country = params.country.toUpperCase();
+
+  const [localRows, lazadaCandidates] = await Promise.all([
+    isProductsDbAvailable()
+      ? Promise.resolve(
+          searchProductCandidates({
+            query: params.query,
+            country,
+            merchants: params.merchants,
+            inStockOnly: true,
+            limit: 300,
+          })
+        )
+      : Promise.resolve([] as ProductRow[]),
+    LAZADA_PRESENCE_COUNTRIES.has(country)
+      ? searchLazadaProducts({ query: params.query, country }).catch((err) => {
+          console.error(`[product-search] Lazada search failed:`, err instanceof Error ? err.message : err);
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
+
+  const localAsCandidates: RankableCandidate[] = localRows.map((r) => ({
+    source: r.merchant === "iherb" ? "iherb_datafeed" : "shopee_datafeed",
+    merchant: r.merchant,
+    productId: r.product_id,
+    shopId: r.shop_id,
+    title: r.title ?? "",
+    category: r.category,
+    brand: r.brand,
+    price: r.price,
+    salePrice: r.sale_price,
+    currency: r.currency,
+    rating: r.rating,
+    reviewCount: null, // local datafeed never carries a true review count — see product-ranking.ts
+    soldCount: r.sold_count,
+    isOfficial: r.is_official === 1,
+    isAd: false,
+    inStock: r.stock == null || r.stock > 0,
+    productUrl: r.product_url ?? "",
+    imageUrl: r.image_url,
+  }));
+
+  let pool: RankableCandidate[] = [...localAsCandidates, ...(lazadaCandidates ?? [])];
+
+  if (pool.length === 0) {
+    console.log(`[product-search] 0 combined candidates for "${params.query}" in ${country}`);
+    return null;
+  }
+
+  if (params.excludeProductIds?.length) {
+    const exclude = new Set(params.excludeProductIds);
+    pool = pool.filter((c) => !exclude.has(c.productId));
+  }
+
+  // Same title-relevance guard as the local-only search (see titleMatchesQuery's
+  // header) — now applied across the pooled Lazada + datafeed candidates together,
+  // so neither source can sneak an irrelevant result past on a non-title field.
+  const titleRelevant = pool.filter((c) => titleMatchesQuery(c.title, params.query));
+  const isExactMatch = titleRelevant.length > 0;
+  if (isExactMatch) pool = titleRelevant;
+
+  // Hard filters (ads/out-of-stock/budget/min-review-floor) — but if they'd wipe out
+  // an otherwise-relevant pool entirely, degrade gracefully and show what we have
+  // rather than nothing (same "no answer is worse than a hedged one" principle as
+  // the isExactMatch fallback below).
+  const filtered = applyHardFilters(pool, { budgetMax: params.budgetMax ?? undefined });
+  const finalPool = filtered.length > 0 ? filtered : pool;
+  if (finalPool.length === 0) {
+    console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country}`);
+    return null;
+  }
+
+  const candidateCount = finalPool.length;
+  const scoredTop20 = shortlist(finalPool, 20);
+
+  const candidatesForLLM = scoredTop20.map((c) => ({
+    product_id: c.productId,
+    merchant: c.merchant, // "shopee" | "iherb" | "lazada"
+    title: c.title,
+    price: c.price,
+    sale_price: c.salePrice,
+    currency: c.currency,
+    rating: c.rating,
+    review_count: c.reviewCount,
+    sold_count: c.soldCount,
+    is_official: c.isOfficial,
+  }));
+
+  const rankingPrompt: ChatMessage[] = [
+    {
+      role: "system",
+      content:
+        `You are a product-ranking engine for a shopping concierge bot that searches multiple ` +
+        `marketplaces at once (Shopee, Lazada, iHerb). You'll get a JSON list of real product ` +
+        `candidates (title, price, sale_price, rating, review_count, sold_count, is_official) each ` +
+        `tagged with which marketplace ("merchant") it's from, plus what the shopper actually asked ` +
+        `for. Pick the 3-5 best, DIVERSE matches across marketplaces — don't return several ` +
+        `near-identical variants of the same item from the same marketplace unless that's genuinely ` +
+        `all that's relevant, and it's fine (good, even) to include picks from more than one ` +
+        `marketplace if both have a genuinely good option; different marketplaces mean different ` +
+        `checkout/delivery for the shopper, which is real, useful choice, not redundancy. Explain each ` +
+        `pick in one short, concrete sentence citing real facts from the candidate (price, rating, ` +
+        `review/sold count, official-store status) AND naming which marketplace it's on — never invent ` +
+        `facts not in the list.\n\n` +
+        `sale_price is the current price if present (price is the pre-discount reference price) — always ` +
+        `reason about sale_price when both are given. Only choose from the given product_id+merchant ` +
+        `pairs, never invent products.\n\n` +
+        (isExactMatch
+          ? ""
+          : `None of these candidates are a confirmed match for what the shopper asked for — they're the ` +
+            `closest items available. Say so plainly in each reasoning sentence rather than implying it's ` +
+            `exactly what they asked for.\n\n`) +
+        `Return ONLY valid JSON, no explanation:\n` +
+        `{ "picks": [ { "product_id": string, "merchant": string, "reasoning": string } ] } — 3 to 5 picks, best first.`,
+    },
+    {
+      role: "user",
+      content: JSON.stringify({ shopper_query: params.query, budget_max: params.budgetMax ?? null, candidates: candidatesForLLM }),
+    },
+  ];
+
+  let picks: ProductPick[] = [];
+  try {
+    const raw = await withTimeout(chat(rankingPrompt, true), STAGE_A_RANKING_TIMEOUT_MS, "combined product ranking");
+    const parsed = JSON.parse(raw) as { picks?: Array<{ product_id: string; merchant: string; reasoning: string }> };
+    const byKey = new Map(scoredTop20.map((c) => [`${c.merchant}:${c.productId}`, c]));
+
+    picks = (parsed.picks ?? [])
+      .map((p): ProductPick | null => {
+        const c = byKey.get(`${p.merchant}:${p.product_id}`);
+        if (!c) return null;
+        return candidateToPick(c, p.reasoning);
+      })
+      .filter((p): p is ProductPick => p !== null)
+      .slice(0, 5);
+  } catch (err) {
+    console.warn(`[product-search] combined Kimi ranking failed, falling back to top rows:`, err instanceof Error ? err.message : err);
+  }
+
+  if (picks.length === 0) {
+    picks = scoredTop20
+      .slice(0, 5)
+      .map((c) =>
+        candidateToPick(c, isExactMatch ? "Top-rated, popular option matching your search." : "Closest available option — not an exact match.")
+      );
+  }
+
+  console.log(
+    `[product-search] combined "${params.query}" (${country}): ${candidateCount} candidates -> ${picks.length} picks (exactMatch=${isExactMatch})`
+  );
+
+  return { query: params.query, country, candidateCount, picks, isExactMatch };
 }
 
 /** Direct title lookup — for when the shopper names a specific product that isn't (or
