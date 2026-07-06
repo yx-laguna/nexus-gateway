@@ -42,7 +42,22 @@ export interface RankableCandidate {
   reviewCount: number | null;
   soldCount: number | null;
   isOfficial: boolean; // official/preferred shop, LazMall
-  isAd: boolean; // sponsored/paid placement — never a quality signal, filtered out before scoring
+  // Lazada's own "isAd"/"isSponsored" search-result flags. Originally treated as a
+  // hard exclusion filter ("paid placement isn't a quality signal") — REVERSED
+  // 2026-07-06 after a real production incident: a live "frying pan" (SG) search
+  // came back with isAd=true on ALL 40/40 results, including obviously legitimate,
+  // well-reviewed listings (e.g. CAROTE, a real cookware brand, 1000+ reviews,
+  // 4.9+ rating). Boosted/sponsored placement is apparently near-universal seller
+  // practice on Lazada's search results, not a rare special case — hard-filtering
+  // on it was silently wiping out the ENTIRE Lazada pool on every search, leaving
+  // only the much thinner local Shopee datafeed to survive into the final picks
+  // (which looked, from the outside, like "Lazada isn't being searched at all,"
+  // when it was — every one of its results was just being discarded). No longer
+  // filtered on at all (see applyHardFilters) — kept here for visibility/future
+  // recalibration only. The review-count-weighted scoring formula below is the
+  // real quality signal and already naturally deprioritizes weak listings
+  // regardless of ad status.
+  isAd: boolean;
   inStock: boolean;
   productUrl: string;
   imageUrl: string | null;
@@ -65,7 +80,9 @@ export function scoreCandidate(c: RankableCandidate): number {
 
 export function applyHardFilters(candidates: RankableCandidate[], opts: { budgetMax?: number } = {}): RankableCandidate[] {
   return candidates.filter((c) => {
-    if (c.isAd) return false; // paid placement isn't a quality/relevance signal
+    // isAd is NOT filtered on — see RankableCandidate's comment for the real
+    // incident that reversed this (100% of a live Lazada result set came back
+    // isAd=true, including clearly legitimate, well-reviewed products).
     if (!c.inStock) return false;
     if (opts.budgetMax != null) {
       const price = c.salePrice ?? c.price;
