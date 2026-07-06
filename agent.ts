@@ -1170,8 +1170,9 @@ function buildReply(
       lines.push(chosenProductPick.productUrl ?? "_(no direct link on file for this one — sorry!)_");
     } else if (productPicks.length > 0) {
       // Real Shopee/iHerb picks from our own catalog — grounded facts, not LLM guesses.
-      // Raw product_url shown directly (no ACP mint / affiliate wrapping yet — discovery
-      // only for now, see product-search.ts).
+      // Mirrors the hotel branch: no link shown in the recommendation list itself — the
+      // direct product_url is only sent once the user names a specific pick (see the
+      // chosenProductPick branch above).
       productPicks.forEach((pick, i) => {
         const price = pick.salePrice ?? pick.price;
         let priceStr = "";
@@ -1182,10 +1183,9 @@ function buildReply(
         const ratingStr = pick.rating ? ` (★${pick.rating}${pick.soldCount ? ` · ${pick.soldCount} sold` : ""})` : "";
         const officialStr = pick.isOfficial ? " ✅ Official Store" : "";
         lines.push(`${i + 1}. *${pick.title}* — ${pick.reasoning}${priceStr}${ratingStr}${officialStr}`);
-        if (pick.productUrl) lines.push(`   ${pick.productUrl}`);
         if (i < productPicks.length - 1) lines.push("");
       });
-      lines.push(`\n_Direct links for now — cashback tracking on these is coming soon 🚧_`);
+      lines.push(`\n_Which one? I'll send the direct link once you pick._`);
     } else if (agodaPicks.length > 0) {
       // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
       // either a live Agoda price (Stage B has run) or a static database estimate.

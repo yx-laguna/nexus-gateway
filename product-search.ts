@@ -73,6 +73,24 @@ function effectivePrice(row: ProductRow): number | null {
   return row.sale_price ?? row.price ?? null;
 }
 
+/** True if at least one meaningful (3+ char) query term literally appears in the
+ *  product's title — used to filter out FTS matches that only hit via category/
+ *  description/brand (see the caller's comment for the real incident this fixes).
+ *  Terms shorter than 3 chars are ignored as too noisy to judge relevance by; if a
+ *  query has no terms that long, relevance can't be meaningfully checked, so nothing
+ *  is filtered out on that basis. */
+function titleMatchesQuery(title: string | null, query: string): boolean {
+  if (!title) return false;
+  const terms = query
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 3);
+  if (terms.length === 0) return true;
+  const lowerTitle = title.toLowerCase();
+  return terms.some((t) => lowerTitle.includes(t));
+}
+
 function toPick(row: ProductRow, reasoning: string): ProductPick {
   return {
     productId: row.product_id,
@@ -122,6 +140,25 @@ export async function searchLocalProducts(params: ProductSearchParams): Promise<
     console.log(`[product-search] 0 candidates for "${params.query}" in ${params.country}`);
     return null;
   }
+
+  // Real bug (2026-07-06): FTS5 indexes title+description+category+brand with equal
+  // weight, so a query like "toothbrush" can match a handful of rows purely via a
+  // category-breadcrumb or description mention (e.g. an "Oral Care" listing that isn't
+  // actually a toothbrush) with no real toothbrush in the catalog at all. Left
+  // unfiltered, Kimi was forced to pick from that irrelevant pool and present a
+  // mouthwash as the "closest match" to a toothbrush request — a real, purchasable,
+  // wrong-item link is worse than no link. Require the query to actually appear in the
+  // TITLE before a row is eligible to be shown as a match; if that leaves nothing, treat
+  // it as a genuine catalog miss (return null) rather than dressing up a near-miss as a
+  // recommendation.
+  const titleRelevant = rows.filter((r) => titleMatchesQuery(r.title, params.query));
+  if (titleRelevant.length === 0) {
+    console.log(
+      `[product-search] "${params.query}" (${params.country}): ${rows.length} FTS candidates but none title-relevant — treating as no catalog match`
+    );
+    return null;
+  }
+  rows = titleRelevant;
 
   if (params.excludeProductIds?.length) {
     const exclude = new Set(params.excludeProductIds);
