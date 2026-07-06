@@ -42,6 +42,18 @@ import { searchLazadaProducts, LAZADA_PRESENCE_COUNTRIES } from "./lazada-search
 
 const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 
+// Real production incident (2026-07-06): searchLazadaProducts' own default maxWaitMs
+// (45s, tuned for the standalone/commit-time case) was being used inline here too,
+// and a single slow-but-eventually-successful Lazada call ate nearly the entire 50s
+// agent.ts pipeline budget by itself (confirmed in Render logs: Lazada returned real
+// results, then the pipeline timed out 3.4s later with nothing left for ranking).
+// This path needs a MUCH tighter budget — a timeout here should just mean "fall back
+// to the local datafeed pool for this turn" (already handled gracefully below), not
+// "risk blowing the whole reply." The generous multi-minute budget stays reserved for
+// the commit-time Shopee check (shopee-price-check.ts), which runs as an async
+// follow-up OUTSIDE this pipeline's timeout entirely.
+const INLINE_LAZADA_TIMEOUT_MS = 12_000;
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -336,7 +348,7 @@ export async function searchCombinedProducts(params: ProductSearchParams): Promi
         )
       : Promise.resolve([] as ProductRow[]),
     LAZADA_PRESENCE_COUNTRIES.has(country)
-      ? searchLazadaProducts({ query: params.query, country }).catch((err) => {
+      ? searchLazadaProducts({ query: params.query, country, maxWaitMs: INLINE_LAZADA_TIMEOUT_MS, pollIntervalMs: 3_000 }).catch((err) => {
           console.error(`[product-search] Lazada search failed:`, err instanceof Error ? err.message : err);
           return null;
         })

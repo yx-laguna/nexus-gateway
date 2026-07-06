@@ -66,6 +66,7 @@ export async function searchLazadaProducts(params: {
   query: string;
   country: string;
   maxWaitMs?: number;
+  pollIntervalMs?: number;
 }): Promise<RankableCandidate[] | null> {
   const country = params.country.toUpperCase();
   const tld = LAZADA_TLD[country];
@@ -74,6 +75,7 @@ export async function searchLazadaProducts(params: {
   const url = `https://www.lazada.${tld}/catalog/?q=${encodeURIComponent(params.query)}`;
   const body = (await runScrapingTask("lazada", url, {
     maxWaitMs: params.maxWaitMs ?? 45_000,
+    pollIntervalMs: params.pollIntervalMs ?? 5_000,
   })) as LazadaSearchResponse | null;
 
   if (!body?.products) {
