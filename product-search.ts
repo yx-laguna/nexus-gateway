@@ -60,10 +60,18 @@ const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 // frying+pan, which is correct (matches Charted Sea's own docs example for MY). It's
 // the same underlying Charted Sea task-queue latency variance already documented in
 // project memory (one earlier isolated test sat in PENDING for 4+ minutes). Bumped to
-// 18s to reduce how often this graceful-fallback path triggers, while keeping enough
-// headroom for a single category to stay well under the 50s pipeline budget alongside
-// the ranking call's own 20s timeout (worst case ~38s + intent-extraction overhead).
-const INLINE_LAZADA_TIMEOUT_MS = 18_000;
+// 18s — but a follow-up MY "running shoes" search STILL timed out at 18s in production,
+// so directly measured real latency live (2026-07-06) instead of guessing again: a
+// single MY query took 16s (concurrent SG that run took 31s), but three MY queries
+// fired concurrently all took ~44s — latency scales with queue load, not country.
+// There is no fixed timeout that reliably fits both ends of that range inside the 50s
+// PIPELINE_TIMEOUT_MS in agent.ts alongside the ranking call's own 20s budget.
+// Decided (Yixin, 2026-07-06): push this higher and accept that an unlucky turn can
+// still hit the pipeline timeout — prioritizing "usually get live Lazada data inline"
+// over "never blow the 50s budget." 28s covers the single-query case comfortably
+// (16-31s observed) and leaves 22s in-budget for the rest of the turn; the
+// concurrent-load 44s case will still occasionally time out this whole reply.
+const INLINE_LAZADA_TIMEOUT_MS = 28_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
