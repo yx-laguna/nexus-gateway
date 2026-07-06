@@ -124,3 +124,35 @@ export function titleMatchesQuery(title: string | null, query: string): boolean 
   const lowerTitle = title.toLowerCase();
   return terms.some((t) => lowerTitle.includes(t));
 }
+
+function normalizeWords(title: string): Set<string> {
+  return new Set(
+    title
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 3)
+  );
+}
+
+/**
+ * Word-overlap similarity — robust to punctuation/formatting differences (e.g. a
+ * brand separator like "|") that break a naive substring check. Returns the
+ * fraction of `reference`'s meaningful (3+ char) words that also appear in
+ * `candidate`. Real incident (2026-07-06): the LLM correctly resolved "number 4" to
+ * "CAROTE Titanium Non-Stick Frying Pan," but the actual shown pick's title was
+ * "CAROTE | Titanium Non-Stick Frying Pan" — the "|" broke a plain
+ * title.includes(needle)/needle.includes(title) check even though every real word
+ * matched, silently failing to resolve the shopper's choice and falling back to
+ * re-showing the whole list. Used both for cross-platform "is this the same item"
+ * checks (shopee-price-check.ts) and for resolving a named/described pick against
+ * the options actually shown (agent.ts).
+ */
+export function titleWordOverlap(reference: string, candidate: string): number {
+  const refWords = normalizeWords(reference);
+  if (refWords.size === 0) return 0;
+  const candWords = normalizeWords(candidate);
+  let overlap = 0;
+  for (const w of refWords) if (candWords.has(w)) overlap++;
+  return overlap / refWords.size;
+}

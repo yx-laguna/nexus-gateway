@@ -30,6 +30,7 @@ import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type Loca
 import { searchCombinedProducts, findProductPickByName, platformLabel, type ProductSearchResult, type ProductPick } from "./product-search.js";
 import { hasLocalCatalog } from "./product-db.js";
 import { LAZADA_PRESENCE_COUNTRIES } from "./lazada-search.js";
+import { titleWordOverlap } from "./product-ranking.js";
 import { checkShopeeAlternative } from "./shopee-price-check.js";
 import { z } from "zod";
 
@@ -502,10 +503,45 @@ export interface EnrichedCategory {
   chosenProductOverride?: ProductPick;
 }
 
+// Deterministic "pick #N from the list" detector — a robustness backstop
+// independent of the LLM's chosen_hotel_text/chosen_product_text resolution, which
+// can fail to exactly match a shown pick's title even when it correctly identified
+// WHICH item was meant (real incident, 2026-07-06: the LLM correctly resolved
+// "number 4" to "CAROTE Titanium Non-Stick Frying Pan," but the actual pick's title
+// had a "|" separator the plain substring check choked on — see
+// titleWordOverlap's comment in product-ranking.ts for the full story). Checked
+// FIRST, ahead of any text-based resolution, for the specific and very common
+// phrasing of picking something by position: "number 4", "#4", "item 4", "option
+// 4", "the 4th one"/"4th", or a word ordinal ("the second one"). Returns a 0-based
+// index, or null if the raw message doesn't contain anything ordinal-shaped.
+const ORDINAL_WORDS: Record<string, number> = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+  sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+};
+function parseOrdinalPick(rawText: string): number | null {
+  const lower = rawText.toLowerCase();
+
+  const keywordMatch = lower.match(/\b(?:number|item|option|choice|pick)\s*#?\s*(\d{1,2})\b/);
+  const hashMatch = lower.match(/#\s*(\d{1,2})\b/);
+  const suffixMatch = lower.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
+  const numeric = keywordMatch ?? hashMatch ?? suffixMatch;
+  if (numeric) {
+    const n = parseInt(numeric[1], 10);
+    if (n >= 1 && n <= 20) return n - 1;
+  }
+
+  for (const [word, n] of Object.entries(ORDINAL_WORDS)) {
+    if (new RegExp(`\\b${word}\\b`).test(lower)) return n - 1;
+  }
+
+  return null;
+}
+
 async function runTools(
   intent: GoalIntent,
   walletAddress: string,
   userId: number,
+  rawText: string,
   mintLinks: boolean = true
 ): Promise<EnrichedCategory[]> {
   // For each category label, an ordered list of Laguna merchant slugs to try.
@@ -732,11 +768,20 @@ async function runTools(
         // picks) unless this turn's chosen_hotel_text happens to match one of the new ones.
         let chosenHotelId: number | undefined = shouldSearch ? undefined : stored?.chosenHotelId;
         let chosenHotelOverride: HotelPick | undefined = shouldSearch ? undefined : stored?.chosenHotelOverride;
-        if (agodaSmart && intent.chosen_hotel_text) {
+        // Ordinal position ("number 2", "the 2nd one") checked FIRST, same
+        // deterministic backstop as the product branch — see parseOrdinalPick's
+        // comment and product-ranking.ts's titleWordOverlap for the real incident
+        // that motivated porting this fix here too.
+        const hotelOrdinalIdx = agodaSmart ? parseOrdinalPick(rawText) : null;
+        if (agodaSmart && hotelOrdinalIdx !== null && agodaSmart.picks[hotelOrdinalIdx]) {
+          chosenHotelId = agodaSmart.picks[hotelOrdinalIdx].hotelId;
+          chosenHotelOverride = undefined;
+          console.log(`[agent] resolved ordinal pick #${hotelOrdinalIdx + 1} -> "${agodaSmart.picks[hotelOrdinalIdx].hotelName}"`);
+        } else if (agodaSmart && intent.chosen_hotel_text) {
           const needle = intent.chosen_hotel_text.trim().toLowerCase();
           const match = agodaSmart.picks.find((p) => {
             const name = p.hotelName.toLowerCase();
-            return needle.length > 0 && (name.includes(needle) || needle.includes(name));
+            return needle.length > 0 && (name.includes(needle) || needle.includes(name) || titleWordOverlap(needle, name) >= 0.6);
           });
           if (match) {
             chosenHotelId = match.hotelId;
@@ -952,11 +997,30 @@ async function runTools(
         // hotel branch's chosenHotelId/chosenHotelOverride resolution.
         let chosenProductKey: string | undefined = shouldSearch ? undefined : stored?.chosenProductKey;
         let chosenProductOverride: ProductPick | undefined = shouldSearch ? undefined : stored?.chosenProductOverride;
-        if (intent.chosen_product_text) {
+
+        // Ordinal position ("number 4", "the 4th one") checked FIRST — a
+        // deterministic, LLM-independent resolution for the single most common way
+        // shoppers pick from a numbered list. See parseOrdinalPick's comment for the
+        // real incident that motivated this.
+        const ordinalIdx = parseOrdinalPick(rawText);
+        if (ordinalIdx !== null && productResult.picks[ordinalIdx]) {
+          const picked = productResult.picks[ordinalIdx];
+          chosenProductKey = `${picked.merchant}:${picked.productId}`;
+          chosenProductOverride = undefined;
+          console.log(`[agent] resolved ordinal pick #${ordinalIdx + 1} -> "${picked.title}" for "${cat.label}"`);
+        } else if (intent.chosen_product_text) {
           const needle = intent.chosen_product_text.trim().toLowerCase();
+          // Exact substring match first; fall back to word-overlap (product-ranking.ts)
+          // for cases where the LLM's resolved text is a close paraphrase of the real
+          // title (different punctuation/separators, e.g. a "|" the LLM dropped) — a
+          // real incident that made a correctly-identified pick silently fail to
+          // resolve. Same 0.6 bar as the cross-platform "is this literally the same
+          // item" check (shopee-price-check.ts) — verified live that a looser 0.5
+          // would false-positive-match on a single shared category word (e.g. "the
+          // sensodyne one" against an unrelated "Colgate Total Toothpaste").
           const match = productResult.picks.find((p) => {
             const title = p.title.toLowerCase();
-            return needle.length > 0 && (title.includes(needle) || needle.includes(title));
+            return needle.length > 0 && (title.includes(needle) || needle.includes(title) || titleWordOverlap(needle, title) >= 0.6);
           });
           if (match) {
             chosenProductKey = `${match.merchant}:${match.productId}`;
@@ -971,6 +1035,8 @@ async function runTools(
               chosenProductOverride = found;
               chosenProductKey = undefined;
               console.log(`[agent] resolved chosen_product_text "${intent.chosen_product_text}" via direct lookup (not in active picks)`);
+            } else {
+              console.log(`[agent] chosen_product_text "${intent.chosen_product_text}" matched nothing in active picks or local DB for "${cat.label}"`);
             }
           }
         }
@@ -1149,21 +1215,17 @@ function buildReply(
   const lines: string[] = [];
   let anyProductChosenThisTurn = false;
 
-  if (purchaseReady) {
-    lines.push(`Great choice! Here's what I found for *${intent.goal}*.\n`);
-  } else {
-    lines.push(`Here are some options for *${intent.goal}*!\n`);
-  }
-
-  for (const cat of intent.categories.slice(0, 4)) {
-    const emoji = emojiFor(cat.label);
+  // Resolve each category's "chosen" pick BEFORE deciding the intro line, so the
+  // generic "Here are some options for X!" opener can be skipped entirely when every
+  // category this turn is purely a confirmation (a chosen hotel/product), not a fresh
+  // list. Real user feedback (2026-07-06): saying "here are some options" immediately
+  // before "Got it — <the one specific thing you picked>" reads as contradictory —
+  // there weren't "some options" shown this turn, just a direct confirmation.
+  const categoriesToShow = intent.categories.slice(0, 4);
+  const resolvedCategories = categoriesToShow.map((cat) => {
     const matched = enrichedByLabel.get(cat.label);
-
-    lines.push(`${emoji} *${cat.label}*`);
-
     const agodaPicks = matched?.agodaSmart?.picks ?? [];
     const productPicks = matched?.productSearch?.picks ?? [];
-    const recs = cat.recommendations.slice(0, 3);
 
     // Once the traveller has both said they're purchase-ready AND singled out a specific
     // hotel by name, re-printing the full 3-option list (often with a freshly re-ranked,
@@ -1183,6 +1245,26 @@ function buildReply(
       (matched?.chosenProductKey != null
         ? productPicks.find((p) => `${p.merchant}:${p.productId}` === matched.chosenProductKey)
         : undefined);
+
+    return { cat, matched, agodaPicks, productPicks, chosenForConfirm, chosenProductPick };
+  });
+
+  const allConfirmedOnly =
+    resolvedCategories.length > 0 &&
+    resolvedCategories.every((r) => (purchaseReady && r.chosenForConfirm) || r.chosenProductPick);
+
+  if (!allConfirmedOnly) {
+    if (purchaseReady) {
+      lines.push(`Great choice! Here's what I found for *${intent.goal}*.\n`);
+    } else {
+      lines.push(`Here are some options for *${intent.goal}*!\n`);
+    }
+  }
+
+  for (const { cat, matched, agodaPicks, productPicks, chosenForConfirm, chosenProductPick } of resolvedCategories) {
+    const emoji = emojiFor(cat.label);
+    lines.push(`${emoji} *${cat.label}*`);
+    const recs = cat.recommendations.slice(0, 3);
 
     if (purchaseReady && chosenForConfirm) {
       lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
@@ -1512,7 +1594,7 @@ async function _processMessage(
     } else if (hasCategories) {
       const purchaseReady = intent.purchase_ready ?? false;
       console.log(`[agent] running tools: ${intent.intent} | ${intent.categories.map(c => c.label).join(", ")} | geo: ${intent.geo ?? userCountry ?? "none"} | purchase_ready=${purchaseReady}`);
-      const enriched = await runTools(intent, walletAddress, userId, purchaseReady);
+      const enriched = await runTools(intent, walletAddress, userId, text, purchaseReady);
       reply = buildReply(intent, enriched, !!walletAddress, userCountry, purchaseReady);
 
       // For each ACP job in flight, send follow-up when it settles

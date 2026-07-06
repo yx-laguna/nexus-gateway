@@ -21,33 +21,18 @@
 
 import { searchProductCandidates, type ProductRow } from "./product-db.js";
 import { searchShopeeLive } from "./shopee-live-search.js";
-import { titleMatchesQuery, scoreCandidate, type RankableCandidate } from "./product-ranking.js";
+import { titleMatchesQuery, scoreCandidate, titleWordOverlap, type RankableCandidate } from "./product-ranking.js";
 import type { ProductPick } from "./product-search.js";
 
-function normalizeWords(title: string): Set<string> {
-  return new Set(
-    title
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, " ")
-      .split(/\s+/)
-      .filter((w) => w.length >= 3)
-  );
-}
-
 /**
- * Word-overlap heuristic — NOT real brand/pack-size parsing, just a conservative
- * first pass. False negatives (missing a real match, so we show it as "closest"
- * instead) are the safe failure mode here; false positives (a wrong "cheaper!"
- * claim) are not, so the bar is deliberately high (60% of the chosen title's
- * meaningful words must reappear).
+ * NOT real brand/pack-size parsing, just a conservative first pass over
+ * titleWordOverlap (product-ranking.ts). False negatives (missing a real match, so
+ * we show it as "closest" instead) are the safe failure mode here; false positives
+ * (a wrong "cheaper!" claim) are not, so the bar is deliberately high (60% of the
+ * chosen title's meaningful words must reappear).
  */
 function isLikelyExactMatch(chosenTitle: string, candidateTitle: string): boolean {
-  const chosenWords = normalizeWords(chosenTitle);
-  if (chosenWords.size === 0) return false;
-  const candWords = normalizeWords(candidateTitle);
-  let overlap = 0;
-  for (const w of chosenWords) if (candWords.has(w)) overlap++;
-  return overlap / chosenWords.size >= 0.6;
+  return titleWordOverlap(chosenTitle, candidateTitle) >= 0.6;
 }
 
 function formatCandidate(c: { title: string; price: number | null; salePrice: number | null; currency: string | null; productUrl: string }): string {
