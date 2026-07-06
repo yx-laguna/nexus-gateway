@@ -67,6 +67,11 @@ export interface ProductSearchResult {
   country: string;
   candidateCount: number;
   picks: ProductPick[];
+  // False when no candidate actually had the query in its title (see
+  // titleMatchesQuery) — picks are the closest available items from the broader
+  // FTS pool, not confirmed matches. Callers should frame these as "similar items"
+  // rather than presenting them as if they satisfy the request.
+  isExactMatch: boolean;
 }
 
 function effectivePrice(row: ProductRow): number | null {
@@ -146,19 +151,23 @@ export async function searchLocalProducts(params: ProductSearchParams): Promise<
   // category-breadcrumb or description mention (e.g. an "Oral Care" listing that isn't
   // actually a toothbrush) with no real toothbrush in the catalog at all. Left
   // unfiltered, Kimi was forced to pick from that irrelevant pool and present a
-  // mouthwash as the "closest match" to a toothbrush request — a real, purchasable,
-  // wrong-item link is worse than no link. Require the query to actually appear in the
-  // TITLE before a row is eligible to be shown as a match; if that leaves nothing, treat
-  // it as a genuine catalog miss (return null) rather than dressing up a near-miss as a
-  // recommendation.
+  // mouthwash as the "closest match" to a toothbrush request, framed exactly like a
+  // real recommendation — a real, purchasable, wrong-item link presented with
+  // unearned confidence. Fixed by requiring the query to actually appear in the TITLE
+  // before a row counts as an exact match. If that leaves nothing, we still show the
+  // closest available items from the broader FTS pool (per explicit instruction — no
+  // answer is worse UX than a hedged one) but tag the result isExactMatch=false so
+  // buildReply can render a "couldn't find a great match, here's similar" intro
+  // instead of presenting them as if they satisfy the request.
   const titleRelevant = rows.filter((r) => titleMatchesQuery(r.title, params.query));
-  if (titleRelevant.length === 0) {
+  const isExactMatch = titleRelevant.length > 0;
+  if (isExactMatch) {
+    rows = titleRelevant;
+  } else {
     console.log(
-      `[product-search] "${params.query}" (${params.country}): ${rows.length} FTS candidates but none title-relevant — treating as no catalog match`
+      `[product-search] "${params.query}" (${params.country}): ${rows.length} FTS candidates but none title-relevant — showing closest items, labelled as non-exact`
     );
-    return null;
   }
-  rows = titleRelevant;
 
   if (params.excludeProductIds?.length) {
     const exclude = new Set(params.excludeProductIds);
@@ -210,6 +219,11 @@ export async function searchLocalProducts(params: ProductSearchParams): Promise<
         `sale_price is the current price if present (price is the pre-discount reference price) — always ` +
         `reason about sale_price when both are given. Only choose from the given product_id values, never ` +
         `invent products.\n\n` +
+        (isExactMatch
+          ? ""
+          : `None of these candidates are a confirmed match for what the shopper asked for — they're the ` +
+            `closest items available in the catalog. Say so plainly in each reasoning sentence (e.g. "closest ` +
+            `available option, not an exact match") rather than implying it's what they asked for.\n\n`) +
         `Return ONLY valid JSON, no explanation:\n` +
         `{ "picks": [ { "product_id": string, "merchant": string, "reasoning": string } ] } — 3 to 4 picks, best first.`,
     },
@@ -242,12 +256,18 @@ export async function searchLocalProducts(params: ProductSearchParams): Promise<
   }
 
   if (picks.length === 0) {
-    picks = scored.slice(0, 4).map((row) => toPick(row, "Top-rated, popular option matching your search."));
+    picks = scored
+      .slice(0, 4)
+      .map((row) =>
+        toPick(row, isExactMatch ? "Top-rated, popular option matching your search." : "Closest available option — not an exact match.")
+      );
   }
 
-  console.log(`[product-search] "${params.query}" (${params.country}): ${candidateCount} candidates -> ${picks.length} picks`);
+  console.log(
+    `[product-search] "${params.query}" (${params.country}): ${candidateCount} candidates -> ${picks.length} picks (exactMatch=${isExactMatch})`
+  );
 
-  return { query: params.query, country: params.country, candidateCount, picks };
+  return { query: params.query, country: params.country, candidateCount, picks, isExactMatch };
 }
 
 /** Direct title lookup — for when the shopper names a specific product that isn't (or

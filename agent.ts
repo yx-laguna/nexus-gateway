@@ -1173,6 +1173,17 @@ function buildReply(
       // Mirrors the hotel branch: no link shown in the recommendation list itself — the
       // direct product_url is only sent once the user names a specific pick (see the
       // chosenProductPick branch above).
+      //
+      // isExactMatch=false (see product-search.ts's titleMatchesQuery) means none of
+      // these actually matched the query in their title — e.g. asking for "toothbrush"
+      // and the catalog only has oral-care items that surfaced via a category/description
+      // mention. Per explicit instruction, don't drop the category to silence in that
+      // case — say plainly we didn't find a great match and offer the closest items
+      // instead, rather than presenting them as if they were what was asked for.
+      const isExactMatch = matched?.productSearch?.isExactMatch ?? true;
+      if (!isExactMatch) {
+        lines.push(`Couldn't find a great match for that — here are the closest items we have:`);
+      }
       productPicks.forEach((pick, i) => {
         const price = pick.salePrice ?? pick.price;
         let priceStr = "";
