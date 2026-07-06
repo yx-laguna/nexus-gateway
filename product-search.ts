@@ -52,7 +52,18 @@ const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 // "risk blowing the whole reply." The generous multi-minute budget stays reserved for
 // the commit-time Shopee check (shopee-price-check.ts), which runs as an async
 // follow-up OUTSIDE this pipeline's timeout entirely.
-const INLINE_LAZADA_TIMEOUT_MS = 12_000;
+//
+// Second incident (2026-07-06, same day): a "frying pan" search in MY gave up at the
+// original 12s ("did not finish within 12000ms") while the SAME session's SG search
+// for the same query succeeded in ~17s wall-clock. Confirmed via Render logs this was
+// NOT a country/domain bug — the URL built was https://www.lazada.com.my/catalog/?q=
+// frying+pan, which is correct (matches Charted Sea's own docs example for MY). It's
+// the same underlying Charted Sea task-queue latency variance already documented in
+// project memory (one earlier isolated test sat in PENDING for 4+ minutes). Bumped to
+// 18s to reduce how often this graceful-fallback path triggers, while keeping enough
+// headroom for a single category to stay well under the 50s pipeline budget alongside
+// the ranking call's own 20s timeout (worst case ~38s + intent-extraction overhead).
+const INLINE_LAZADA_TIMEOUT_MS = 18_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
