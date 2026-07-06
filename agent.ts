@@ -902,7 +902,26 @@ async function runTools(
         // recommendations?" kept the query as "socks" (same as before), so it looked
         // identical to just repeating the same search and kept returning the exact
         // same stored picks turn after turn.
-        const queryChanged = !!intent.product_query && intent.product_query !== stored?.query;
+        //
+        // Hard disable, mirroring the exact fix already applied to hotels above (see
+        // namingSpecificHotel / the "Park Royal" bug) — naming a specific product is a
+        // NARROWING/decision signal, never a request for something new, and should
+        // never spawn a fresh, unrelated search. Real bug (2026-07-06, Render logs):
+        // "lets get the 4th one" kept re-triggering a full re-search that returned 5
+        // completely different products (the one actually meant wasn't even among
+        // them) — product_query gets re-extracted on every turn, and even a harmless
+        // capitalization difference ("Samsung TV" vs "samsung tv", confirmed in the
+        // logs one search apart) made queryChanged look true. When chosen_product_text
+        // is set, ignore queryChanged entirely and trust the picks already shown —
+        // only a genuinely new country, or an explicit "show me different ones",
+        // should re-search. Query comparison is also now case/whitespace-insensitive
+        // as defense in depth, so incidental re-extraction drift can't trigger this
+        // even when chosen_product_text ISN'T set.
+        const namingSpecificProduct = !!intent.chosen_product_text;
+        const queryChanged =
+          !namingSpecificProduct &&
+          !!intent.product_query &&
+          intent.product_query.trim().toLowerCase() !== (stored?.query ?? "").trim().toLowerCase();
         const countryChanged = !!intent.geo && intent.geo !== stored?.country;
         const shouldSearch = !stored || queryChanged || countryChanged || intent.wants_different_products;
 
