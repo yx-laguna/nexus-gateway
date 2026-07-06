@@ -1517,8 +1517,18 @@ export async function processMessage(
   const history = getHistory(userId);
   history.push({ role: "user", content: text });
 
-  // Timeout covers only the fast path (LLM + Laguna search); ACP runs beyond this
-  const PIPELINE_TIMEOUT_MS = 50_000;
+  // Timeout covers only the fast path (LLM + Laguna search); ACP runs beyond this.
+  // Raised 50s->70s (2026-07-06, Yixin's call) to give inline Lazada search room to
+  // use its own newly-raised 45s budget (see INLINE_LAZADA_TIMEOUT_MS in
+  // product-search.ts) plus the 20s Kimi ranking step, after live-measuring Charted
+  // Sea latency scaling to ~44s under concurrent queue load. This is a deliberate
+  // trade: an unlucky turn (slow Lazada + slow ranking + slow intent extraction all
+  // at once) can still exceed 70s, but it's a much rarer combination than a single
+  // Lazada call alone exceeding a tighter budget. No external constraint forces this
+  // number — bot.ts ACKs the Telegram webhook immediately and processes in the
+  // background (confirmed 2026-07-06), so raising this only affects how long the user
+  // waits for their reply, not any infra timeout.
+  const PIPELINE_TIMEOUT_MS = 70_000;
   let timeoutId: ReturnType<typeof setTimeout>;
   const timeoutPromise = new Promise<string>((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error("pipeline timeout")), PIPELINE_TIMEOUT_MS);

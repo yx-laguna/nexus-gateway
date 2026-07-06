@@ -388,6 +388,16 @@ bot.on("message:text", async (ctx: Context) => {
   // Only show the waiting message for shopping/travel queries that hit the
   // full LLM + Laguna pipeline. Short casual messages respond in <2s.
   await ctx.replyWithChatAction("typing");
+  // Telegram's "typing…" indicator only lasts ~5s per call, but the pipeline can now
+  // run up to 70s (PIPELINE_TIMEOUT_MS, raised 2026-07-06 to give inline Lazada search
+  // more room) — without a refresh, the indicator would disappear ~5s in and the chat
+  // would look dead for the remaining ~65s even though the bot is still working.
+  // Re-send every 4s (under the 5s expiry) until processMessage settles either way.
+  const typingInterval = setInterval(() => {
+    ctx.replyWithChatAction("typing").catch(() => {
+      // Best-effort — a failed typing ping shouldn't ever block or crash the real reply.
+    });
+  }, 4_000);
   try {
     const chatId = ctx.chat!.id;
     // Same graceful-degrade as sendChunk below: a minted shortlink or hotel/product
@@ -414,6 +424,8 @@ bot.on("message:text", async (ctx: Context) => {
       `⚠️ Something went wrong:\n\`${errMsg}\`\n\nTry again or use /new to reset.`,
       { parse_mode: "Markdown" }
     );
+  } finally {
+    clearInterval(typingInterval);
   }
 });
 

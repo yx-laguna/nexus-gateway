@@ -68,10 +68,17 @@ const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 // PIPELINE_TIMEOUT_MS in agent.ts alongside the ranking call's own 20s budget.
 // Decided (Yixin, 2026-07-06): push this higher and accept that an unlucky turn can
 // still hit the pipeline timeout — prioritizing "usually get live Lazada data inline"
-// over "never blow the 50s budget." 28s covers the single-query case comfortably
-// (16-31s observed) and leaves 22s in-budget for the rest of the turn; the
-// concurrent-load 44s case will still occasionally time out this whole reply.
-const INLINE_LAZADA_TIMEOUT_MS = 28_000;
+// over "never blow the 50s budget." First bumped to 28s (single-query case only).
+//
+// Third pass, same day: rather than keep nudging this in isolation, Yixin also raised
+// agent.ts's PIPELINE_TIMEOUT_MS from 50s to 70s specifically to make room for this.
+// Bumped to 45s to match the measured concurrent-load ceiling (~44s) — 45s Lazada +
+// the 20s Kimi ranking timeout = 65s, leaving only ~5s for intent extraction/DB/
+// network overhead inside the 70s pipeline budget. This is intentionally tight: an
+// unlucky turn where Lazada, ranking, AND intent extraction are all slow at once can
+// still trip the full pipeline timeout — accepted tradeoff, see agent.ts's
+// PIPELINE_TIMEOUT_MS comment for the reasoning.
+const INLINE_LAZADA_TIMEOUT_MS = 45_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
