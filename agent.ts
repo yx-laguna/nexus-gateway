@@ -1305,9 +1305,21 @@ function buildReply(
     lines.push(`${emoji} *${cat.label}*`);
     const recs = cat.recommendations.slice(0, 3);
 
+    // Tracks whether the if/else-if chain below actually rendered something for this
+    // category — used further down to suppress the legacy bare "→ via {platform}"
+    // pointer, which predates productSearchFailed/pendingLazada and doesn't know about
+    // them. Real incident (2026-07-2x): a "Still checking Lazada for X..." message got
+    // a contentless "→ via shopee" line tacked on right after it, because that
+    // fallback's own check (!hasMerchant && no picks) doesn't know an honest message
+    // was already shown right above it — same root cause class as the recs-fallback
+    // bug (a code path built before a later case existed, firing on old assumptions).
+    let contentShown = false;
+
     if (purchaseReady && chosenForConfirm) {
+      contentShown = true;
       lines.push(`Got it — locking in *${chosenForConfirm.hotelName}* for your stay. Sending the booking link next! 🔗`);
     } else if (chosenProductPick) {
+      contentShown = true;
       anyProductChosenThisTurn = true;
       // Direct link policy (2026-07-05): Shopee/iHerb have no ACP mint path worth taking
       // (no live affiliate program / no bridge special case yet), so show the raw
@@ -1334,6 +1346,7 @@ function buildReply(
       // mention. Per explicit instruction, don't drop the category to silence in that
       // case — say plainly we didn't find a great match and offer the closest items
       // instead, rather than presenting them as if they were what was asked for.
+      contentShown = true;
       const isExactMatch = matched?.productSearch?.isExactMatch ?? true;
       if (!isExactMatch) {
         lines.push(`Couldn't find a great match for that — here are the closest items we have:`);
@@ -1358,6 +1371,7 @@ function buildReply(
       });
       lines.push(`\n_Which one? I'll send the direct link once you pick._`);
     } else if (agodaPicks.length > 0) {
+      contentShown = true;
       // Real hotel picks from our own DB — grounded facts, not LLM guesses. Price shown is
       // either a live Agoda price (Stage B has run) or a static database estimate.
       agodaPicks.forEach((pick, i) => {
@@ -1387,8 +1401,10 @@ function buildReply(
       // rather than either fabricating something (the "coke" incident this whole
       // flow replaces) or claiming outright failure when it's really just still
       // running.
+      contentShown = true;
       lines.push(`Still checking Lazada for *${cat.label}* — I'll follow up here in a moment with what I find.`);
     } else if (matched?.productSearchFailed) {
+      contentShown = true;
       // A real live search WAS attempted for this retail category and came back with
       // nothing — never fall through to the LLM-guessed recs below for this case (see
       // productSearchFailed's doc comment on EnrichedCategory for the real incident
@@ -1403,6 +1419,7 @@ function buildReply(
       // check-in dates), not when a search ran and failed (that's productSearchFailed,
       // handled above). These are the intent-extraction LLM's own guessed suggestions,
       // not real listings — fine as a rough pointer, never as a stand-in for real data.
+      contentShown = recs.length > 0;
       recs.forEach((rec, i) => {
         lines.push(`${i + 1}. ${rec}`);
         if (i < recs.length - 1) lines.push(""); // blank line between options, not after the last
@@ -1430,8 +1447,17 @@ function buildReply(
         const alsoStr = extras ? ` (also on ${extras})` : "";
         lines.push(`→ We recommend booking via *${primaryName}*${alsoStr} — _affiliate link coming shortly_ ⏳`);
       }
-    } else if (!hasMerchant && agodaPicks.length === 0 && productPicks.length === 0) {
-      // Nothing resolved at all for this category — no merchant, no real search results.
+    } else if (!hasMerchant && agodaPicks.length === 0 && productPicks.length === 0 && !contentShown) {
+      // Nothing resolved at all for this category — no merchant, no real search
+      // results, AND nothing else was said above either. That last check
+      // (!contentShown) was missing before (real incident, 2026-07-2x): this branch
+      // used to fire purely on "no merchant + no picks," with no awareness that the
+      // main if/else-if chain above might have already shown an honest message (e.g.
+      // "Still checking Lazada for X..." or the productSearchFailed message) — since
+      // those cases ALSO have no merchant and no picks, a bare, contentless
+      // "→ via shopee" was getting tacked on right after an otherwise-complete
+      // message, implying something unresolved when something honest had already
+      // been said.
       lines.push(`→ via ${cat.platform_search}`);
     }
 
