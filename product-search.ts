@@ -39,6 +39,7 @@ import {
   type RankableCandidate,
 } from "./product-ranking.js";
 import { startLazadaSearch, continueLazadaSearch, LAZADA_PRESENCE_COUNTRIES, type LazadaSearchHandle } from "./lazada-search.js";
+import { SHOPEE_LIVE_PRESENCE_COUNTRIES } from "./shopee-live-search.js";
 
 const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 
@@ -130,6 +131,13 @@ export interface ProductSearchResult {
   // either Lazada isn't a market here, it already settled (results are already merged
   // into picks above), or the search wasn't attempted at all.
   pendingLazada?: LazadaSearchHandle;
+  // Set ONLY when local datafeed + Lazada BOTH came up empty (see
+  // searchCombinedProducts) — "try Shopee too" (2026-07-2x): live Shopee search is a
+  // last-resort supplement, not a routine third parallel source, since it's the
+  // slowest/flakiest of the three (routinely 2+ minutes, real block failures — see
+  // shopee-live-search.ts). agent.ts's pollPendingShopeeLiveAndFollowUp picks this up
+  // the same way it does pendingLazada.
+  pendingShopeeLive?: { query: string; country: string; merchants?: string[] };
 }
 
 function effectivePrice(row: ProductRow): number | null {
@@ -519,15 +527,31 @@ export async function searchCombinedProducts(params: ProductSearchParams): Promi
     pool = pool.filter((c) => !exclude.has(c.productId));
   }
 
+  // Builds the "nothing to show YET, but something's still in flight" result shared
+  // by both empty-pool cases below. "Try Shopee too" (2026-07-2x, real incident: a
+  // "San Pellegrino" search failed outright when Lazada's submit itself errored with
+  // HTTP 502 and the local datafeed had nothing — with retries now in place that
+  // specific case is less likely, but local+Lazada can still both legitimately have
+  // nothing, e.g. a very niche item). Live Shopee search is ONLY offered here, as a
+  // last-resort supplement when the other two sources found nothing at all — not a
+  // routine third parallel source on every turn — since it's the slowest/flakiest of
+  // the three (see shopee-live-search.ts). Returns null (genuine total failure) only
+  // when NEITHER Lazada nor Shopee-live can even be tried for this country.
+  const buildPendingResult = (): ProductSearchResult | null => {
+    const pendingLazada = stillPending && lazadaHandle ? lazadaHandle : undefined;
+    const pendingShopeeLive = SHOPEE_LIVE_PRESENCE_COUNTRIES.has(country)
+      ? { query: params.query, country, merchants: params.merchants }
+      : undefined;
+    if (!pendingLazada && !pendingShopeeLive) return null;
+    return { query: params.query, country, candidateCount: 0, picks: [], isExactMatch: true, pendingLazada, pendingShopeeLive };
+  };
+
   if (pool.length === 0) {
-    if (stillPending && lazadaHandle) {
-      // Nothing to show YET, but Lazada is still genuinely in flight — return an
-      // explicit "still checking" result (empty picks, pendingLazada set) rather than
-      // null, so buildReply can say so honestly instead of falling back to a
-      // fabricated "couldn't find anything" or LLM-guessed recs (see the "coke"
-      // incident in feedback_search_reliability_patterns memory).
-      console.log(`[product-search] 0 immediate candidates for "${params.query}" in ${country} — Lazada still in flight, will follow up`);
-      return { query: params.query, country, candidateCount: 0, picks: [], isExactMatch: true, pendingLazada: lazadaHandle };
+    const pending = buildPendingResult();
+    if (pending) {
+      const sources = [pending.pendingLazada && "Lazada", pending.pendingShopeeLive && "Shopee-live"].filter(Boolean).join(" + ");
+      console.log(`[product-search] 0 immediate candidates for "${params.query}" in ${country} — ${sources} still in flight, will follow up`);
+      return pending;
     }
     console.log(`[product-search] 0 combined candidates for "${params.query}" in ${country}`);
     return null;
@@ -535,9 +559,11 @@ export async function searchCombinedProducts(params: ProductSearchParams): Promi
 
   const ranked = await rankProductPool({ query: params.query, budgetMax: params.budgetMax ?? undefined, pool });
   if (!ranked) {
-    if (stillPending && lazadaHandle) {
-      console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country} — Lazada still in flight, will follow up`);
-      return { query: params.query, country, candidateCount: 0, picks: [], isExactMatch: true, pendingLazada: lazadaHandle };
+    const pending = buildPendingResult();
+    if (pending) {
+      const sources = [pending.pendingLazada && "Lazada", pending.pendingShopeeLive && "Shopee-live"].filter(Boolean).join(" + ");
+      console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country} — ${sources} still in flight, will follow up`);
+      return pending;
     }
     console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country}`);
     return null;

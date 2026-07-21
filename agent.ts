@@ -32,6 +32,7 @@ import { hasLocalCatalog } from "./product-db.js";
 import { LAZADA_PRESENCE_COUNTRIES, continueLazadaSearch, type LazadaSearchHandle } from "./lazada-search.js";
 import { titleWordOverlap, type RankableCandidate } from "./product-ranking.js";
 import { checkShopeeAlternative } from "./shopee-price-check.js";
+import { searchShopeeLive } from "./shopee-live-search.js";
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,13 @@ const lastProductSearch = new Map<string, StoredProductSearch>();
 // message, each eventually sending its own "found it on Lazada" follow-up for the
 // same handle.
 const pendingLazadaPolls = new Set<string>();
+
+// Same idea for the background live-Shopee follow-up (pollPendingShopeeLiveAndFollowUp,
+// "try Shopee too" 2026-07-2x) — keyed by searchKey (userId:category) rather than a
+// task uuid, since a live-Shopee attempt doesn't get a resumable handle the way
+// Lazada does (searchShopeeLive submits+waits in one call); this just prevents two
+// concurrent background Shopee searches for the same user+category.
+const pendingShopeeLivePolls = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // System prompt — concierge-first, USDC as a footnote
@@ -1392,17 +1400,27 @@ function buildReply(
         lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning}${priceStr}${distanceStr}${ratingStr}`);
         if (i < agodaPicks.length - 1) lines.push(""); // blank line between options, not after the last
       });
-    } else if (productPicks.length === 0 && matched?.productSearch?.pendingLazada) {
-      // Nothing to show YET, but a Lazada search is genuinely still in flight (see
-      // product-search.ts's searchCombinedProducts/pendingLazada and this file's
-      // pollPendingLazadaAndFollowUp) — Charted Sea's own dashboard confirms Lazada
-      // essentially always eventually succeeds, it's just routinely slower than any
-      // budget we can block a reply on. Say so honestly and promise a follow-up,
-      // rather than either fabricating something (the "coke" incident this whole
-      // flow replaces) or claiming outright failure when it's really just still
-      // running.
+    } else if (productPicks.length === 0 && (matched?.productSearch?.pendingLazada || matched?.productSearch?.pendingShopeeLive)) {
+      // Nothing to show YET, but at least one live search is genuinely still in
+      // flight (see product-search.ts's searchCombinedProducts/pendingLazada+
+      // pendingShopeeLive and this file's pollPendingLazadaAndFollowUp /
+      // pollPendingShopeeLiveAndFollowUp) — Charted Sea's own dashboard confirms
+      // Lazada essentially always eventually succeeds, it's just routinely slower
+      // than any budget we can block a reply on; live Shopee search is slower still
+      // but genuinely worth trying as a last resort once local+Lazada both come up
+      // empty ("try Shopee too," 2026-07-2x). Say so honestly and promise a
+      // follow-up, rather than either fabricating something (the "coke" incident
+      // this whole flow replaces) or claiming outright failure when it's really just
+      // still running. Name whichever source(s) are actually in flight so the
+      // promise matches reality.
       contentShown = true;
-      lines.push(`Still checking Lazada for *${cat.label}* — I'll follow up here in a moment with what I find.`);
+      const checking = [
+        matched?.productSearch?.pendingLazada && "Lazada",
+        matched?.productSearch?.pendingShopeeLive && "Shopee",
+      ]
+        .filter(Boolean)
+        .join(" and ");
+      lines.push(`Still checking ${checking} for *${cat.label}* — I'll follow up here with what I find.`);
     } else if (matched?.productSearchFailed) {
       contentShown = true;
       // A real live search WAS attempted for this retail category and came back with
@@ -1704,6 +1722,89 @@ async function pollPendingLazadaAndFollowUp(args: {
   await onFollowUp(lines.join("\n"));
 }
 
+// Background continuation for the "try Shopee too" last-resort supplement
+// (2026-07-2x): only ever scheduled when searchCombinedProducts already found NOTHING
+// from both the local datafeed and the Lazada peek (see pendingShopeeLive), since
+// live Shopee search is the slowest/flakiest of the three sources (real
+// BLOCKED_TOO_MANY_TIMES failures, routinely 2+ minutes — see shopee-live-search.ts).
+// Structurally mirrors pollPendingLazadaAndFollowUp, but there's no resumable
+// handle/uuid here — searchShopeeLive submits+waits in one call, so this either
+// finds something within its own budget or it doesn't; no further resume attempt.
+async function pollPendingShopeeLiveAndFollowUp(args: {
+  pending: { query: string; country: string; merchants?: string[] };
+  cat: EnrichedCategory;
+  searchKey: string;
+  onFollowUp: (msg: string) => Promise<void>;
+}): Promise<void> {
+  const { pending, cat, searchKey, onFollowUp } = args;
+  const hadNothingYet = (cat.productSearch?.picks.length ?? 0) === 0;
+
+  console.log(`[agent] trying live Shopee search for "${cat.label}" ("${pending.query}", ${pending.country})`);
+
+  let candidates: RankableCandidate[] | null;
+  try {
+    candidates = await searchShopeeLive({ query: pending.query, country: pending.country });
+  } catch (err) {
+    console.error(`[agent] live Shopee search failed for "${cat.label}":`, err instanceof Error ? err.message : err);
+    candidates = null;
+  }
+
+  const stored = lastProductSearch.get(searchKey);
+  if (stored && stored.result.pendingShopeeLive?.query === pending.query && stored.result.pendingShopeeLive.country === pending.country) {
+    stored.result = { ...stored.result, pendingShopeeLive: undefined };
+  }
+
+  if (!candidates || candidates.length === 0) {
+    if (hadNothingYet) {
+      await onFollowUp(`Checked Shopee for *${cat.label}* too — didn't find anything there either, sorry.`);
+    }
+    return;
+  }
+
+  const alreadyShownIds = new Set((stored?.result.picks ?? cat.productSearch?.picks ?? []).map((p) => p.productId));
+  const freshCandidates = candidates.filter((c) => !alreadyShownIds.has(c.productId));
+  if (freshCandidates.length === 0) {
+    if (hadNothingYet) {
+      await onFollowUp(`Checked Shopee for *${cat.label}* too — didn't find anything there either, sorry.`);
+    }
+    return;
+  }
+
+  let ranked: { picks: ProductPick[]; isExactMatch: boolean } | null = null;
+  try {
+    ranked = await rankProductPool({ query: pending.query, pool: freshCandidates });
+  } catch (err) {
+    console.error(`[agent] Shopee follow-up ranking failed for "${cat.label}":`, err instanceof Error ? err.message : err);
+  }
+
+  if (!ranked || ranked.picks.length === 0) {
+    if (hadNothingYet) {
+      await onFollowUp(`Checked Shopee for *${cat.label}* too — didn't find anything there either, sorry.`);
+    }
+    return;
+  }
+
+  if (stored) {
+    stored.result = { ...stored.result, picks: [...stored.result.picks, ...ranked.picks] };
+  }
+
+  const lines = [`Also just found on Shopee for *${cat.label}*:\n`];
+  ranked.picks.forEach((pick, i) => {
+    const price = pick.salePrice ?? pick.price;
+    let priceStr = "";
+    if (price !== null) {
+      const wasDiscounted = pick.salePrice !== null && pick.price !== null && pick.salePrice < pick.price;
+      priceStr = ` · ${pick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${pick.currency ?? ""} ${pick.price!.toFixed(2)})` : ""}`;
+    }
+    const volumeStr = pick.reviewCount ? ` · ${pick.reviewCount} reviews` : pick.soldCount ? ` · ${pick.soldCount} sold` : "";
+    const ratingStr = pick.rating ? ` (★${pick.rating}${volumeStr})` : "";
+    lines.push(`${i + 1}. *${pick.title}* (${platformLabel(pick.merchant)}) — ${pick.reasoning}${priceStr}${ratingStr}`);
+    if (i < ranked!.picks.length - 1) lines.push("");
+  });
+  lines.push(`\n_Want one of these? Just let me know which._`);
+  await onFollowUp(lines.join("\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1880,6 +1981,25 @@ async function _processMessage(
             })
             .finally(() => {
               pendingLazadaPolls.delete(handle.uuid);
+            });
+        }
+
+        // "Try Shopee too" (2026-07-2x): last-resort live Shopee search, only ever
+        // scheduled when local datafeed + Lazada BOTH came up empty (see
+        // product-search.ts's pendingShopeeLive). pendingShopeeLivePolls guards
+        // against a duplicate concurrent poller for the same user+category.
+        for (const cat of enriched) {
+          const pending = cat.productSearch?.pendingShopeeLive;
+          if (!pending) continue;
+          const searchKey = `${userId}:${cat.label}`;
+          if (pendingShopeeLivePolls.has(searchKey)) continue;
+          pendingShopeeLivePolls.add(searchKey);
+          pollPendingShopeeLiveAndFollowUp({ pending, cat, searchKey, onFollowUp })
+            .catch((err) => {
+              console.error(`[agent] Shopee-live follow-up failed for "${cat.label}":`, err instanceof Error ? err.message : err);
+            })
+            .finally(() => {
+              pendingShopeeLivePolls.delete(searchKey);
             });
         }
       }

@@ -43,6 +43,12 @@ const SHOPEE_CURRENCY: Record<string, string> = {
   VN: "VND",
 };
 
+// Exported (2026-07-2x, "try Shopee too") so product-search.ts/agent.ts can check
+// country availability before scheduling a background live-Shopee search as a
+// last-resort supplement when local datafeed + Lazada both come up empty — mirrors
+// LAZADA_PRESENCE_COUNTRIES in lazada-search.ts.
+export const SHOPEE_LIVE_PRESENCE_COUNTRIES = new Set(Object.keys(SHOPEE_TLD));
+
 interface ShopeeItemRating {
   rating_star?: number;
   // [total, 1-star, 2-star, 3-star, 4-star, 5-star] — index 0 is the true review

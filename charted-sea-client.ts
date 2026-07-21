@@ -85,12 +85,31 @@ const TERMINAL_STATUSES = new Set(["SUCCESS", "BLOCKED_TOO_MANY_TIMES", "ERROR_T
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Real incident (2026-07-21): a "San Pellegrino sparkling water" search failed
+// outright with `[charted-sea] submit failed for lazada: HTTP 502` — a one-off
+// gateway error on Charted Sea's own side, not a timeout, and not something retrying
+// the exact same request a moment later should reasonably fail again on. Distinguish
+// "worth retrying" (5xx, or anything that isn't a clean HTTP-status error at all —
+// a network blip, an aborted request) from "won't fix itself" (4xx — bad token, bad
+// request — retrying immediately just wastes time and a paid request).
+function isRetryableSubmitError(err: unknown): boolean {
+  if (!(err instanceof Error)) return true;
+  const match = err.message.match(/HTTP (\d+)/);
+  if (!match) return true; // not an HTTP-status error (network error, abort, etc.) — worth a retry
+  return Number(match[1]) >= 500;
+}
+
 /**
  * Submit a scraping task and return its uuid immediately (near-instant — this is just
- * the "start the job" call, not the wait). Returns null on a submit failure (missing
- * token, HTTP error, malformed response) rather than throwing, so callers building a
- * "reply now, follow up later" flow (see lazada-search.ts's startLazadaSearch) can
- * treat "couldn't even start" the same way as any other empty-result case.
+ * the "start the job" call, not the wait). Returns null once retries are exhausted
+ * (missing token, HTTP error, malformed response) rather than throwing, so callers
+ * building a "reply now, follow up later" flow (see lazada-search.ts's
+ * startLazadaSearch) can treat "couldn't even start" the same way as any other
+ * empty-result case.
+ *
+ * Retries up to `retries` total attempts (default 2) with a short delay, but only for
+ * errors judged retryable (see isRetryableSubmitError) — a 4xx fails fast since
+ * retrying won't help.
  *
  * Split out from runScrapingTask (2026-07-2x) specifically so a caller can submit,
  * peek briefly, and — if it's not done yet — hand the uuid to a LATER, separate poll
@@ -100,13 +119,28 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * anything is polling it — see Charted Sea's own docs on why we don't use
  * waitForCompletion=true — so resuming polling on the same uuid later is always safe.
  */
-export async function submitScrapingTask(scraper: ChartedSeaScraper, url: string): Promise<string | null> {
-  try {
-    return await submitTask(scraper, url);
-  } catch (err) {
-    console.error(`[charted-sea] ${scraper} submit error for ${url}:`, err instanceof Error ? err.message : err);
-    return null;
+export async function submitScrapingTask(
+  scraper: ChartedSeaScraper,
+  url: string,
+  opts: { retries?: number; retryDelayMs?: number } = {}
+): Promise<string | null> {
+  const retries = opts.retries ?? 2;
+  const retryDelayMs = opts.retryDelayMs ?? 1_500;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await submitTask(scraper, url);
+    } catch (err) {
+      const retryable = isRetryableSubmitError(err);
+      console.error(
+        `[charted-sea] ${scraper} submit error for ${url} (attempt ${attempt}/${retries}${retryable ? "" : ", not retrying — looks permanent"}):`,
+        err instanceof Error ? err.message : err
+      );
+      if (!retryable || attempt === retries) return null;
+      await sleep(retryDelayMs);
+    }
   }
+  return null;
 }
 
 /**
