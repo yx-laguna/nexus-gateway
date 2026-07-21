@@ -1464,10 +1464,21 @@ function buildReply(
     lines.push(""); // blank line between categories
   }
 
+  // Whether this turn actually has real options/results to react to anywhere — real
+  // picks (product or hotel), or a confirmed choice/link. Real incident (2026-07-2x):
+  // "Which of these catches your eye?" and the country footer were showing up even
+  // when the only thing said all turn was "Still checking Lazada for X..." — there
+  // was nothing to catch anyone's eye, so the prompt (and the footer scoping options
+  // to a country) made no sense. Both are now gated on this.
+  const hasAnyLink = enriched.some((e) => e.acpJob || e.link?.shortlink);
+  const anyRealContent =
+    anyProductChosenThisTurn ||
+    hasAnyLink ||
+    resolvedCategories.some((r) => (purchaseReady && r.chosenForConfirm) || r.productPicks.length > 0 || r.agodaPicks.length > 0);
+
   if (purchaseReady) {
     // Generic cashback line — no merchant-specific rate/dollar breakdown anymore, just
     // one consistent line whenever at least one bookable link exists.
-    const hasAnyLink = enriched.some((e) => e.acpJob || e.link?.shortlink);
     if (hasAnyLink) {
       lines.push(`_Receive up to 6% in cashback when you book via our link 💸_`);
     }
@@ -1475,12 +1486,16 @@ function buildReply(
     // Already handed over a direct link above for the item they named — don't immediately
     // follow it with "which of these catches your eye", which reads as if nothing happened.
     lines.push(`Want to look at anything else, or need another item?`);
-  } else {
+  } else if (anyRealContent) {
     // Browsing mode — soft close, invite them to pick
     lines.push(`Which of these catches your eye? Happy to dig deeper or send you a booking link when you're ready!`);
   }
+  // else: nothing real to prompt about yet (e.g. every category this turn is "still
+  // checking Lazada" or a genuine "couldn't find anything") — stay quiet rather than
+  // inviting a choice that doesn't exist yet. The follow-up message (or a retry) will
+  // speak for itself once there's something real to react to.
 
-  if (userCountry) {
+  if (userCountry && anyRealContent) {
     lines.push(`\n_Showing options for *${userCountry}*. Different region? \`/setcountry\`_`);
   }
 
