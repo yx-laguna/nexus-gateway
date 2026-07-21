@@ -27,10 +27,10 @@ import {
 } from "./laguna.js";
 import { acpMintLink } from "./acp.js";
 import { searchLocalHotels, fetchLiveAgodaPrices, findHotelPickByName, type LocalSearchResult, type HotelPick } from "./agoda-search.js";
-import { searchCombinedProducts, findProductPickByName, platformLabel, type ProductSearchResult, type ProductPick } from "./product-search.js";
+import { searchCombinedProducts, findProductPickByName, rankProductPool, platformLabel, type ProductSearchResult, type ProductPick } from "./product-search.js";
 import { hasLocalCatalog } from "./product-db.js";
-import { LAZADA_PRESENCE_COUNTRIES } from "./lazada-search.js";
-import { titleWordOverlap } from "./product-ranking.js";
+import { LAZADA_PRESENCE_COUNTRIES, continueLazadaSearch, type LazadaSearchHandle } from "./lazada-search.js";
+import { titleWordOverlap, type RankableCandidate } from "./product-ranking.js";
 import { checkShopeeAlternative } from "./shopee-price-check.js";
 import { z } from "zod";
 
@@ -96,6 +96,13 @@ interface StoredProductSearch {
   chosenProductOverride?: ProductPick;
 }
 const lastProductSearch = new Map<string, StoredProductSearch>();
+
+// Guards against scheduling more than one background poll for the same Lazada task
+// (see pollPendingLazadaAndFollowUp). Without this, a shopper sending several
+// messages while a search is still pending would spawn a duplicate poller per
+// message, each eventually sending its own "found it on Lazada" follow-up for the
+// same handle.
+const pendingLazadaPolls = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // System prompt — concierge-first, USDC as a footnote
@@ -1371,6 +1378,16 @@ function buildReply(
         lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning}${priceStr}${distanceStr}${ratingStr}`);
         if (i < agodaPicks.length - 1) lines.push(""); // blank line between options, not after the last
       });
+    } else if (productPicks.length === 0 && matched?.productSearch?.pendingLazada) {
+      // Nothing to show YET, but a Lazada search is genuinely still in flight (see
+      // product-search.ts's searchCombinedProducts/pendingLazada and this file's
+      // pollPendingLazadaAndFollowUp) — Charted Sea's own dashboard confirms Lazada
+      // essentially always eventually succeeds, it's just routinely slower than any
+      // budget we can block a reply on. Say so honestly and promise a follow-up,
+      // rather than either fabricating something (the "coke" incident this whole
+      // flow replaces) or claiming outright failure when it's really just still
+      // running.
+      lines.push(`Still checking Lazada for *${cat.label}* — I'll follow up here in a moment with what I find.`);
     } else if (matched?.productSearchFailed) {
       // A real live search WAS attempted for this retail category and came back with
       // nothing — never fall through to the LLM-guessed recs below for this case (see
@@ -1547,6 +1564,105 @@ async function buildShopeePriceCheckMessage(intent: GoalIntent, enriched: Enrich
   return null;
 }
 
+// Background continuation for a Lazada search that hadn't finished by the time the
+// main reply went out (see product-search.ts's searchCombinedProducts / pendingLazada
+// field, and this file's buildReply branch for "Still checking Lazada..."). Decided
+// 2026-07-2x ("checking Lazada") after confirming directly against Charted Sea's own
+// dashboard that Lazada essentially always eventually succeeds (100% success rate
+// observed) — it's just routinely slower than any inline budget we can afford. Rather
+// than keep raising a timeout that will always eventually get beaten by a slower
+// request (see product-search.ts's INLINE_LAZADA_PEEK_MS comment for that whole
+// history), this just lets the already-submitted task keep running and reports back
+// once it actually lands.
+const LAZADA_FOLLOWUP_TIMEOUT_MS = 100_000;
+
+async function pollPendingLazadaAndFollowUp(args: {
+  handle: LazadaSearchHandle;
+  cat: EnrichedCategory;
+  searchKey: string;
+  onFollowUp: (msg: string) => Promise<void>;
+}): Promise<void> {
+  const { handle, cat, searchKey, onFollowUp } = args;
+  const hadNothingYet = (cat.productSearch?.picks.length ?? 0) === 0;
+
+  console.log(`[agent] continuing background Lazada poll for "${cat.label}" ("${handle.query}", ${handle.country})`);
+
+  let candidates: RankableCandidate[] | null;
+  try {
+    candidates = await continueLazadaSearch(handle, { maxWaitMs: LAZADA_FOLLOWUP_TIMEOUT_MS, pollIntervalMs: 5_000 });
+  } catch (err) {
+    console.error(`[agent] background Lazada poll failed for "${cat.label}":`, err instanceof Error ? err.message : err);
+    candidates = null;
+  }
+
+  // Clear the pending handle on the stored search either way, so a later turn doesn't
+  // try to follow up on this same handle again (the pendingLazadaPolls Set already
+  // prevents concurrent duplicate pollers, but this also stops a stale handle from
+  // lingering on stored state indefinitely once we're done with it).
+  const stored = lastProductSearch.get(searchKey);
+  if (stored && stored.result.pendingLazada?.uuid === handle.uuid) {
+    stored.result = { ...stored.result, pendingLazada: undefined };
+  }
+
+  if (!candidates || candidates.length === 0) {
+    if (hadNothingYet) {
+      await onFollowUp(`Checked Lazada for *${cat.label}* too — didn't find anything there either, sorry.`);
+    }
+    // Else: the shopper already got a real answer (local picks) in the main reply —
+    // Lazada simply had nothing new to add, not worth an extra message for.
+    return;
+  }
+
+  // Don't repeat anything already shown in the main reply.
+  const alreadyShownIds = new Set((stored?.result.picks ?? cat.productSearch?.picks ?? []).map((p) => p.productId));
+  const freshCandidates = candidates.filter((c) => !alreadyShownIds.has(c.productId));
+  if (freshCandidates.length === 0) {
+    if (hadNothingYet) {
+      await onFollowUp(`Checked Lazada for *${cat.label}* too — didn't find anything there either, sorry.`);
+    }
+    return;
+  }
+
+  let ranked: { picks: ProductPick[]; isExactMatch: boolean } | null = null;
+  try {
+    ranked = await rankProductPool({ query: handle.query, pool: freshCandidates });
+  } catch (err) {
+    console.error(`[agent] Lazada follow-up ranking failed for "${cat.label}":`, err instanceof Error ? err.message : err);
+  }
+
+  if (!ranked || ranked.picks.length === 0) {
+    if (hadNothingYet) {
+      await onFollowUp(`Checked Lazada for *${cat.label}* too — didn't find anything there either, sorry.`);
+    }
+    return;
+  }
+
+  // Merge the new picks into the stored search so they become selectable ("get me
+  // the lazada one") in later turns, same as anything shown in the original reply.
+  // Note: position-based picks ("number 2") against just THIS follow-up list aren't
+  // guaranteed to line up with their position in the merged array — fine for now,
+  // name/title-based resolution (parseOrdinalPick's fallback path) still works.
+  if (stored) {
+    stored.result = { ...stored.result, picks: [...stored.result.picks, ...ranked.picks] };
+  }
+
+  const lines = [`Also just found on Lazada for *${cat.label}*:\n`];
+  ranked.picks.forEach((pick, i) => {
+    const price = pick.salePrice ?? pick.price;
+    let priceStr = "";
+    if (price !== null) {
+      const wasDiscounted = pick.salePrice !== null && pick.price !== null && pick.salePrice < pick.price;
+      priceStr = ` · ${pick.currency ?? ""} ${price.toFixed(2)}${wasDiscounted ? ` (was ${pick.currency ?? ""} ${pick.price!.toFixed(2)})` : ""}`;
+    }
+    const volumeStr = pick.reviewCount ? ` · ${pick.reviewCount} reviews` : pick.soldCount ? ` · ${pick.soldCount} sold` : "";
+    const ratingStr = pick.rating ? ` (★${pick.rating}${volumeStr})` : "";
+    lines.push(`${i + 1}. *${pick.title}* (${platformLabel(pick.merchant)}) — ${pick.reasoning}${priceStr}${ratingStr}`);
+    if (i < ranked!.picks.length - 1) lines.push("");
+  });
+  lines.push(`\n_Want one of these? Just let me know which._`);
+  await onFollowUp(lines.join("\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1706,6 +1822,25 @@ async function _processMessage(
           .catch((err) => {
             console.error(`[agent] Shopee price-check follow-up failed:`, err instanceof Error ? err.message : err);
           });
+
+        // Continue checking any Lazada search that didn't land in time for the main
+        // reply (see product-search.ts's pendingLazada / this file's
+        // pollPendingLazadaAndFollowUp) — "checking Lazada" decision, 2026-07-2x.
+        // pendingLazadaPolls guards against scheduling a duplicate poller for the same
+        // handle if the shopper sends another message before this one resolves.
+        for (const cat of enriched) {
+          const handle = cat.productSearch?.pendingLazada;
+          if (!handle || pendingLazadaPolls.has(handle.uuid)) continue;
+          pendingLazadaPolls.add(handle.uuid);
+          const searchKey = `${userId}:${cat.label}`;
+          pollPendingLazadaAndFollowUp({ handle, cat, searchKey, onFollowUp })
+            .catch((err) => {
+              console.error(`[agent] Lazada follow-up failed for "${cat.label}":`, err instanceof Error ? err.message : err);
+            })
+            .finally(() => {
+              pendingLazadaPolls.delete(handle.uuid);
+            });
+        }
       }
 
       // Append clarification if something important is still missing

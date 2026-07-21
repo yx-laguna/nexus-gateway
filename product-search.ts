@@ -38,47 +38,25 @@ import {
   titleMatchesQuery,
   type RankableCandidate,
 } from "./product-ranking.js";
-import { searchLazadaProducts, LAZADA_PRESENCE_COUNTRIES } from "./lazada-search.js";
+import { startLazadaSearch, continueLazadaSearch, LAZADA_PRESENCE_COUNTRIES, type LazadaSearchHandle } from "./lazada-search.js";
 
 const STAGE_A_RANKING_TIMEOUT_MS = 20_000;
 
-// Real production incident (2026-07-06): searchLazadaProducts' own default maxWaitMs
-// (45s, tuned for the standalone/commit-time case) was being used inline here too,
-// and a single slow-but-eventually-successful Lazada call ate nearly the entire 50s
-// agent.ts pipeline budget by itself (confirmed in Render logs: Lazada returned real
-// results, then the pipeline timed out 3.4s later with nothing left for ranking).
-// This path needs a MUCH tighter budget — a timeout here should just mean "fall back
-// to the local datafeed pool for this turn" (already handled gracefully below), not
-// "risk blowing the whole reply." The generous multi-minute budget stays reserved for
-// the commit-time Shopee check (shopee-price-check.ts), which runs as an async
-// follow-up OUTSIDE this pipeline's timeout entirely.
+// History (2026-07-06): this used to be a single INLINE_LAZADA_TIMEOUT_MS that kept
+// getting raised — 12s, 18s, 28s, 45s — each time beaten by a real, slower request
+// (see project memory "Charted Sea live search eval" for the full sequence, including
+// the MY "frying pan"/"running shoes" incidents and the SG "coke" incident that
+// confirmed via Charted Sea's own dashboard that Lazada essentially always succeeds,
+// just not necessarily within any budget we can afford to block a reply on).
 //
-// Second incident (2026-07-06, same day): a "frying pan" search in MY gave up at the
-// original 12s ("did not finish within 12000ms") while the SAME session's SG search
-// for the same query succeeded in ~17s wall-clock. Confirmed via Render logs this was
-// NOT a country/domain bug — the URL built was https://www.lazada.com.my/catalog/?q=
-// frying+pan, which is correct (matches Charted Sea's own docs example for MY). It's
-// the same underlying Charted Sea task-queue latency variance already documented in
-// project memory (one earlier isolated test sat in PENDING for 4+ minutes). Bumped to
-// 18s — but a follow-up MY "running shoes" search STILL timed out at 18s in production,
-// so directly measured real latency live (2026-07-06) instead of guessing again: a
-// single MY query took 16s (concurrent SG that run took 31s), but three MY queries
-// fired concurrently all took ~44s — latency scales with queue load, not country.
-// There is no fixed timeout that reliably fits both ends of that range inside the 50s
-// PIPELINE_TIMEOUT_MS in agent.ts alongside the ranking call's own 20s budget.
-// Decided (Yixin, 2026-07-06): push this higher and accept that an unlucky turn can
-// still hit the pipeline timeout — prioritizing "usually get live Lazada data inline"
-// over "never blow the 50s budget." First bumped to 28s (single-query case only).
-//
-// Third pass, same day: rather than keep nudging this in isolation, Yixin also raised
-// agent.ts's PIPELINE_TIMEOUT_MS from 50s to 70s specifically to make room for this.
-// Bumped to 45s to match the measured concurrent-load ceiling (~44s) — 45s Lazada +
-// the 20s Kimi ranking timeout = 65s, leaving only ~5s for intent extraction/DB/
-// network overhead inside the 70s pipeline budget. This is intentionally tight: an
-// unlucky turn where Lazada, ranking, AND intent extraction are all slow at once can
-// still trip the full pipeline timeout — accepted tradeoff, see agent.ts's
-// PIPELINE_TIMEOUT_MS comment for the reasoning.
-const INLINE_LAZADA_TIMEOUT_MS = 45_000;
+// Decided 2026-07-2x ("checking Lazada"): stop trying to find a timeout that fits.
+// Give Lazada a short, genuinely opportunistic peek — just long enough to catch the
+// occasional fast case (VN succeeded in ~12s in one live test) — and if it's not done
+// by then, reply with whatever's available (local datafeed, or an honest "still
+// checking" message) and let agent.ts's pollPendingLazadaAndFollowUp keep polling the
+// same task in the background, sending a follow-up message once it actually lands.
+// See searchCombinedProducts' pendingLazada field.
+const INLINE_LAZADA_PEEK_MS = 12_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -145,6 +123,13 @@ export interface ProductSearchResult {
   // FTS pool, not confirmed matches. Callers should frame these as "similar items"
   // rather than presenting them as if they satisfy the request.
   isExactMatch: boolean;
+  // Set when searchCombinedProducts kicked off a Lazada search that hadn't finished
+  // by the time this result needed to go out (see INLINE_LAZADA_PEEK_MS). agent.ts's
+  // pollPendingLazadaAndFollowUp picks this up and keeps checking in the background,
+  // sending a follow-up message with any real results once they land. Undefined means
+  // either Lazada isn't a market here, it already settled (results are already merged
+  // into picks above), or the search wasn't attempted at all.
+  pendingLazada?: LazadaSearchHandle;
 }
 
 function effectivePrice(row: ProductRow): number | null {
@@ -346,77 +331,25 @@ export async function searchLocalProducts(params: ProductSearchParams): Promise<
 }
 
 /**
- * Combined Lazada (live) + Shopee/iHerb (local datafeed) search — decided
- * 2026-07-06 (see project memory "Charted Sea live search eval"): every
- * recommendation turn queries both fast sources in parallel, pools candidates
- * through the shared scoring formula (product-ranking.ts), and lets Kimi pick 3-5
- * across BOTH platforms together rather than treating them as separate lists.
- *
- * The live Shopee scraper is deliberately NOT part of this path — see
- * shopee-live-search.ts's header for why (routinely 2+ minutes, real block
- * failures) — it's reserved for the commit-time-only price-check
- * (shopee-price-check.ts). Only the free/instant local Shopee datafeed and the
- * fast/reliable live Lazada search run inline here.
+ * Shared ranking tail: given a pool of candidates from ANY source (local datafeed,
+ * live Lazada, or both), apply the title-relevance guard, hard filters, shortlist,
+ * and Kimi cross-platform ranking. Extracted (2026-07-2x) so both the main combined
+ * search AND agent.ts's background Lazada follow-up (pollPendingLazadaAndFollowUp,
+ * ranking a Lazada-only pool once it lands late) can share one ranking prompt/logic
+ * instead of drifting into two copies. Returns null when the pool is empty or the
+ * hard filters would wipe it out entirely with nothing to fall back to.
  */
-export async function searchCombinedProducts(params: ProductSearchParams): Promise<ProductSearchResult | null> {
-  const country = params.country.toUpperCase();
-
-  const [localRows, lazadaCandidates] = await Promise.all([
-    isProductsDbAvailable()
-      ? Promise.resolve(
-          searchProductCandidates({
-            query: params.query,
-            country,
-            merchants: params.merchants,
-            inStockOnly: true,
-            limit: 300,
-          })
-        )
-      : Promise.resolve([] as ProductRow[]),
-    LAZADA_PRESENCE_COUNTRIES.has(country)
-      ? searchLazadaProducts({ query: params.query, country, maxWaitMs: INLINE_LAZADA_TIMEOUT_MS, pollIntervalMs: 3_000 }).catch((err) => {
-          console.error(`[product-search] Lazada search failed:`, err instanceof Error ? err.message : err);
-          return null;
-        })
-      : Promise.resolve(null),
-  ]);
-
-  const localAsCandidates: RankableCandidate[] = localRows.map((r) => ({
-    source: r.merchant === "iherb" ? "iherb_datafeed" : "shopee_datafeed",
-    merchant: r.merchant,
-    productId: r.product_id,
-    shopId: r.shop_id,
-    title: r.title ?? "",
-    category: r.category,
-    brand: r.brand,
-    price: r.price,
-    salePrice: r.sale_price,
-    currency: r.currency,
-    rating: r.rating,
-    reviewCount: null, // local datafeed never carries a true review count — see product-ranking.ts
-    soldCount: r.sold_count,
-    isOfficial: r.is_official === 1,
-    isAd: false,
-    inStock: r.stock == null || r.stock > 0,
-    productUrl: r.product_url ?? "",
-    imageUrl: r.image_url,
-  }));
-
-  let pool: RankableCandidate[] = [...localAsCandidates, ...(lazadaCandidates ?? [])];
-
-  if (pool.length === 0) {
-    console.log(`[product-search] 0 combined candidates for "${params.query}" in ${country}`);
-    return null;
-  }
-
-  if (params.excludeProductIds?.length) {
-    const exclude = new Set(params.excludeProductIds);
-    pool = pool.filter((c) => !exclude.has(c.productId));
-  }
+export async function rankProductPool(params: {
+  query: string;
+  budgetMax?: number;
+  pool: RankableCandidate[];
+}): Promise<{ picks: ProductPick[]; isExactMatch: boolean; candidateCount: number } | null> {
+  let pool = params.pool;
+  if (pool.length === 0) return null;
 
   // Same title-relevance guard as the local-only search (see titleMatchesQuery's
-  // header) — now applied across the pooled Lazada + datafeed candidates together,
-  // so neither source can sneak an irrelevant result past on a non-title field.
+  // header) — applied across whatever sources are pooled together, so none of them
+  // can sneak an irrelevant result past on a non-title field.
   const titleRelevant = pool.filter((c) => titleMatchesQuery(c.title, params.query));
   const isExactMatch = titleRelevant.length > 0;
   if (isExactMatch) pool = titleRelevant;
@@ -427,10 +360,7 @@ export async function searchCombinedProducts(params: ProductSearchParams): Promi
   // the isExactMatch fallback below).
   const filtered = applyHardFilters(pool, { budgetMax: params.budgetMax ?? undefined });
   const finalPool = filtered.length > 0 ? filtered : pool;
-  if (finalPool.length === 0) {
-    console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country}`);
-    return null;
-  }
+  if (finalPool.length === 0) return null;
 
   const candidateCount = finalPool.length;
   const scoredTop20 = shortlist(finalPool, 20);
@@ -507,11 +437,125 @@ export async function searchCombinedProducts(params: ProductSearchParams): Promi
       );
   }
 
+  return { picks, isExactMatch, candidateCount };
+}
+
+/**
+ * Combined Lazada (live) + Shopee/iHerb (local datafeed) search — decided
+ * 2026-07-06 (see project memory "Charted Sea live search eval"): pools candidates
+ * from both sources through the shared scoring formula (product-ranking.ts) and lets
+ * Kimi pick 3-5 across BOTH platforms together rather than treating them as separate
+ * lists.
+ *
+ * Reworked 2026-07-2x ("checking Lazada" decision): this no longer blocks the reply
+ * on Lazada. The local datafeed query is synchronous/instant; Lazada is submitted and
+ * given only a short opportunistic peek (INLINE_LAZADA_PEEK_MS) to land inline. If it
+ * doesn't, the result carries a `pendingLazada` handle instead of Lazada candidates —
+ * agent.ts's pollPendingLazadaAndFollowUp keeps checking in the background and sends
+ * a follow-up message once real results arrive. This directly replaces the old
+ * approach of just raising the inline timeout further (see INLINE_LAZADA_PEEK_MS's
+ * comment for why that kept failing).
+ *
+ * The live Shopee scraper is still deliberately NOT part of this path — see
+ * shopee-live-search.ts's header for why (routinely 2+ minutes, real block
+ * failures) — it stays commit-time-only (shopee-price-check.ts).
+ */
+export async function searchCombinedProducts(params: ProductSearchParams): Promise<ProductSearchResult | null> {
+  const country = params.country.toUpperCase();
+
+  const localRows = isProductsDbAvailable()
+    ? searchProductCandidates({
+        query: params.query,
+        country,
+        merchants: params.merchants,
+        inStockOnly: true,
+        limit: 300,
+      })
+    : ([] as ProductRow[]);
+
+  let lazadaHandle: LazadaSearchHandle | null = null;
+  let lazadaCandidates: RankableCandidate[] | null = null;
+  if (LAZADA_PRESENCE_COUNTRIES.has(country)) {
+    try {
+      lazadaHandle = await startLazadaSearch({ query: params.query, country });
+      if (lazadaHandle) {
+        lazadaCandidates = await continueLazadaSearch(lazadaHandle, { maxWaitMs: INLINE_LAZADA_PEEK_MS, pollIntervalMs: 3_000 });
+      }
+    } catch (err) {
+      console.error(`[product-search] Lazada search failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+  // Lazada submitted OK but didn't land within the peek window — still genuinely in
+  // flight server-side, not failed. Carry the handle forward so agent.ts can keep
+  // checking on it and follow up later, instead of treating this like Lazada came up
+  // empty.
+  const stillPending = lazadaHandle !== null && lazadaCandidates === null;
+
+  const localAsCandidates: RankableCandidate[] = localRows.map((r) => ({
+    source: r.merchant === "iherb" ? "iherb_datafeed" : "shopee_datafeed",
+    merchant: r.merchant,
+    productId: r.product_id,
+    shopId: r.shop_id,
+    title: r.title ?? "",
+    category: r.category,
+    brand: r.brand,
+    price: r.price,
+    salePrice: r.sale_price,
+    currency: r.currency,
+    rating: r.rating,
+    reviewCount: null, // local datafeed never carries a true review count — see product-ranking.ts
+    soldCount: r.sold_count,
+    isOfficial: r.is_official === 1,
+    isAd: false,
+    inStock: r.stock == null || r.stock > 0,
+    productUrl: r.product_url ?? "",
+    imageUrl: r.image_url,
+  }));
+
+  let pool: RankableCandidate[] = [...localAsCandidates, ...(lazadaCandidates ?? [])];
+
+  if (params.excludeProductIds?.length) {
+    const exclude = new Set(params.excludeProductIds);
+    pool = pool.filter((c) => !exclude.has(c.productId));
+  }
+
+  if (pool.length === 0) {
+    if (stillPending && lazadaHandle) {
+      // Nothing to show YET, but Lazada is still genuinely in flight — return an
+      // explicit "still checking" result (empty picks, pendingLazada set) rather than
+      // null, so buildReply can say so honestly instead of falling back to a
+      // fabricated "couldn't find anything" or LLM-guessed recs (see the "coke"
+      // incident in feedback_search_reliability_patterns memory).
+      console.log(`[product-search] 0 immediate candidates for "${params.query}" in ${country} — Lazada still in flight, will follow up`);
+      return { query: params.query, country, candidateCount: 0, picks: [], isExactMatch: true, pendingLazada: lazadaHandle };
+    }
+    console.log(`[product-search] 0 combined candidates for "${params.query}" in ${country}`);
+    return null;
+  }
+
+  const ranked = await rankProductPool({ query: params.query, budgetMax: params.budgetMax ?? undefined, pool });
+  if (!ranked) {
+    if (stillPending && lazadaHandle) {
+      console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country} — Lazada still in flight, will follow up`);
+      return { query: params.query, country, candidateCount: 0, picks: [], isExactMatch: true, pendingLazada: lazadaHandle };
+    }
+    console.log(`[product-search] combined filters left 0 candidates for "${params.query}" in ${country}`);
+    return null;
+  }
+
   console.log(
-    `[product-search] combined "${params.query}" (${country}): ${candidateCount} candidates -> ${picks.length} picks (exactMatch=${isExactMatch})`
+    `[product-search] combined "${params.query}" (${country}): ${ranked.candidateCount} candidates -> ${ranked.picks.length} picks ` +
+      `(exactMatch=${ranked.isExactMatch}, lazadaPending=${stillPending})`
   );
 
-  return { query: params.query, country, candidateCount, picks, isExactMatch };
+  return {
+    query: params.query,
+    country,
+    candidateCount: ranked.candidateCount,
+    picks: ranked.picks,
+    isExactMatch: ranked.isExactMatch,
+    pendingLazada: stillPending && lazadaHandle ? lazadaHandle : undefined,
+  };
 }
 
 /** Direct title lookup — for when the shopper names a specific product that isn't (or

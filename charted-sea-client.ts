@@ -86,28 +86,45 @@ const TERMINAL_STATUSES = new Set(["SUCCESS", "BLOCKED_TOO_MANY_TIMES", "ERROR_T
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Submit a scraping task and poll until it reaches a terminal status or maxWaitMs
- * elapses. Returns the parsed JSON responseBody on SUCCESS, or null for every other
- * outcome — a block/timeout/error here is a normal, expected result (especially for
- * Shopee), not a bug, so this deliberately never throws for those cases. Only a
- * missing CHARTEDSEA_API_TOKEN or a malformed API response throws.
+ * Submit a scraping task and return its uuid immediately (near-instant — this is just
+ * the "start the job" call, not the wait). Returns null on a submit failure (missing
+ * token, HTTP error, malformed response) rather than throwing, so callers building a
+ * "reply now, follow up later" flow (see lazada-search.ts's startLazadaSearch) can
+ * treat "couldn't even start" the same way as any other empty-result case.
+ *
+ * Split out from runScrapingTask (2026-07-2x) specifically so a caller can submit,
+ * peek briefly, and — if it's not done yet — hand the uuid to a LATER, separate poll
+ * (pollScrapingTaskUntil) that keeps checking in the background, instead of being
+ * stuck with runScrapingTask's all-in-one "wait up to maxWaitMs then give up for
+ * good" shape. The task itself keeps running server-side regardless of whether
+ * anything is polling it — see Charted Sea's own docs on why we don't use
+ * waitForCompletion=true — so resuming polling on the same uuid later is always safe.
  */
-export async function runScrapingTask(
+export async function submitScrapingTask(scraper: ChartedSeaScraper, url: string): Promise<string | null> {
+  try {
+    return await submitTask(scraper, url);
+  } catch (err) {
+    console.error(`[charted-sea] ${scraper} submit error for ${url}:`, err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+/**
+ * Poll an already-submitted task (see submitScrapingTask) until it reaches a terminal
+ * status or maxWaitMs elapses. Returns the parsed JSON responseBody on SUCCESS, or
+ * null for every other outcome (block/timeout/error) — never throws for those, same
+ * as runScrapingTask below. Giving up here does NOT cancel the task — it keeps
+ * running server-side, so calling this again with the same uuid later (e.g. from a
+ * background follow-up job) can still pick up a real result.
+ */
+export async function pollScrapingTaskUntil(
   scraper: ChartedSeaScraper,
-  url: string,
+  uuid: string,
   opts: { maxWaitMs?: number; pollIntervalMs?: number } = {}
 ): Promise<unknown | null> {
   const maxWaitMs = opts.maxWaitMs ?? 60_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 5_000;
   const deadline = Date.now() + maxWaitMs;
-
-  let uuid: string;
-  try {
-    uuid = await submitTask(scraper, url);
-  } catch (err) {
-    console.error(`[charted-sea] ${scraper} submit error for ${url}:`, err instanceof Error ? err.message : err);
-    return null;
-  }
 
   while (Date.now() < deadline) {
     await sleep(pollIntervalMs);
@@ -130,14 +147,31 @@ export async function runScrapingTask(
       }
     }
     if (TERMINAL_STATUSES.has(task.status)) {
-      console.warn(
-        `[charted-sea] ${scraper} task ended in ${task.status} for ${url}${task.errorMessage ? `: ${task.errorMessage}` : ""}`
-      );
+      console.warn(`[charted-sea] ${scraper} task ${uuid} ended in ${task.status}${task.errorMessage ? `: ${task.errorMessage}` : ""}`);
       return null;
     }
     // PENDING / RUNNING / BLOCKED (still being retried server-side) — keep polling.
   }
 
-  console.warn(`[charted-sea] ${scraper} task for ${url} did not finish within ${maxWaitMs}ms — giving up`);
+  console.warn(
+    `[charted-sea] ${scraper} task ${uuid} did not finish within ${maxWaitMs}ms this pass — giving up for now ` +
+      `(the task itself keeps running server-side; a later call with the same uuid can still succeed)`
+  );
   return null;
+}
+
+/**
+ * Convenience wrapper for callers that just want a single submit-then-wait call with
+ * no need to resume later (e.g. the commit-time Shopee price-check, which already
+ * budgets a generous ~170s and has nowhere useful to resume from if that's not
+ * enough). Equivalent to submitScrapingTask + pollScrapingTaskUntil.
+ */
+export async function runScrapingTask(
+  scraper: ChartedSeaScraper,
+  url: string,
+  opts: { maxWaitMs?: number; pollIntervalMs?: number } = {}
+): Promise<unknown | null> {
+  const uuid = await submitScrapingTask(scraper, url);
+  if (!uuid) return null;
+  return pollScrapingTaskUntil(scraper, uuid, opts);
 }
