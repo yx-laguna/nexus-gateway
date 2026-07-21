@@ -501,6 +501,19 @@ export interface EnrichedCategory {
   chosenProductKey?: string;
   // Mirrors chosenHotelOverride — set when the chosen product isn't in productSearch.picks.
   chosenProductOverride?: ProductPick;
+  // Set when a retail category's live search (searchCombinedProducts) was actually
+  // attempted and came back with nothing — Lazada timed out AND the local datafeed had
+  // zero matches (real incident, 2026-07-20: "coke"/"Coca-Cola..." in SG — Lazada gave
+  // up at 45s, local datafeed genuinely has no beverage products). Distinguishes "we
+  // tried and got nothing" from "matched is undefined because this category never got
+  // this far" (e.g. a hotel category still waiting on check-in dates) — buildReply
+  // needs this to know NOT to fall back to cat.recommendations for this category, since
+  // those are just the intent-extraction LLM's guessed suggestions, not real listings.
+  // Real incident: without this flag, buildReply silently rendered fake "Coca-Cola
+  // Original 325ml x 24 cans ~$15" picks with no product behind them, so "get me the
+  // link" could never resolve to anything real — see feedback_search_reliability_patterns
+  // memory, "never show a wrong/placeholder item with unearned confidence."
+  productSearchFailed?: boolean;
 }
 
 // Deterministic "pick #N from the list" detector — a robustness backstop
@@ -991,7 +1004,26 @@ async function runTools(
           }
         }
 
-        if (!productResult) throw new Error(`No product search results for ${cat.label}`);
+        // Don't throw here anymore — throwing drops this category out of `results`
+        // entirely, leaving buildReply with zero signal that a real search was even
+        // attempted. That made it indistinguishable from a hotel category still
+        // waiting on check-in dates, so buildReply fell back to printing the
+        // intent-extraction LLM's own guessed recommendations as if they were real
+        // listings (real incident, 2026-07-20: "coke" in SG — Lazada timed out at 45s,
+        // local datafeed had zero matches, and the shopper got a fully-formatted list
+        // of fake Coca-Cola SKUs with fake prices and no product behind any of them —
+        // "get me the link" could never resolve). Return an honest, explicitly-flagged
+        // empty result instead so buildReply can say so plainly.
+        if (!productResult) {
+          console.warn(`[agent] product search came back empty for "${cat.label}" ("${queryText}") — showing an honest "couldn't find live results" message, not LLM-guessed recs`);
+          return {
+            label: cat.label,
+            recommendations: [],
+            info: { id: "", name: cat.label } as MerchantInfo,
+            link: null,
+            productSearchFailed: true,
+          } satisfies EnrichedCategory;
+        }
 
         // Resolve which product (if any) the shopper has singled out, mirroring the
         // hotel branch's chosenHotelId/chosenHotelOverride resolution.
@@ -1339,9 +1371,21 @@ function buildReply(
         lines.push(`${i + 1}. *${pick.hotelName}* — ${pick.reasoning}${priceStr}${distanceStr}${ratingStr}`);
         if (i < agodaPicks.length - 1) lines.push(""); // blank line between options, not after the last
       });
+    } else if (matched?.productSearchFailed) {
+      // A real live search WAS attempted for this retail category and came back with
+      // nothing — never fall through to the LLM-guessed recs below for this case (see
+      // productSearchFailed's doc comment on EnrichedCategory for the real incident
+      // this fixes). Say so plainly instead of showing fabricated listings with no
+      // product behind them.
+      lines.push(
+        `Couldn't get live results for this just now — Lazada didn't respond in time and we don't have a local match either. Try again in a moment, or ask about a different item.`
+      );
     } else {
-      // Fall back to Step 1's LLM-knowledge recommendations (no real search data yet —
-      // e.g. dates not given, or city didn't resolve to an Agoda city_id).
+      // Fall back to Step 1's LLM-knowledge recommendations — ONLY reachable when this
+      // category never reached a real search at all (e.g. a hotel still waiting on
+      // check-in dates), not when a search ran and failed (that's productSearchFailed,
+      // handled above). These are the intent-extraction LLM's own guessed suggestions,
+      // not real listings — fine as a rough pointer, never as a stand-in for real data.
       recs.forEach((rec, i) => {
         lines.push(`${i + 1}. ${rec}`);
         if (i < recs.length - 1) lines.push(""); // blank line between options, not after the last
